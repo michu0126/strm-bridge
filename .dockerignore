@@ -1,0 +1,9 @@
+.git
+.github
+tests
+data
+__pycache__
+*.pyc
+.env
+*.png
+*.zip
