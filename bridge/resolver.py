@@ -1,4 +1,4 @@
-"""Minimal unary gRPC-web client for CD2; no cookies or video bytes leave this service."""
+"""Optional playback adapters; folder scanning never depends on a cloud service."""
 from pathlib import Path, PurePosixPath
 import base64
 import json
@@ -20,7 +20,7 @@ def cloud_path(local, config):
         root = Path(m['local']).resolve()
         if p.is_relative_to(root):
             return '/' + str(PurePosixPath(m['cloud'].lstrip('/')) / p.relative_to(root).as_posix()).strip('/')
-    raise ValueError('未配置此挂载路径对应的 CD2 网盘目录')
+    raise ValueError('未配置此挂载路径对应的直链目录；仅生成挂载路径时无需此设置')
 
 def varint(n):
     data = bytearray()
@@ -107,7 +107,70 @@ class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 
+def json_api(origin, endpoint, data, token='', user_agent=''):
+    valid_url(origin)
+    req = Request(origin.rstrip('/') + endpoint, data=json.dumps(data).encode(),
+                  headers={'Content-Type': 'application/json',
+                           **({'Authorization': token} if token else {}),
+                           **({'User-Agent': user_agent} if user_agent else {})})
+    try:
+        with build_opener(ProxyHandler({})).open(req, timeout=25) as r:
+            result = json.loads(r.read(4 * 1024 * 1024))
+    except HTTPError as e:
+        raise ValueError('直链服务返回 HTTP ' + str(e.code)) from None
+    if result.get('code') != 200:
+        raise ValueError('直链服务请求失败：' + str(result.get('message', '未知错误')))
+    return result.get('data') or {}
+
+
+def openlist_token(config):
+    if config.get('openlist_token'):
+        return config['openlist_token']
+    if config.get('openlist_user') and config.get('openlist_password'):
+        return json_api(config['openlist_url'], '/api/auth/login',
+                        {'username': config['openlist_user'], 'password': config['openlist_password']})['token']
+    return ''
+
+
 def resolve(local, config, user_agent=''):
+    provider = config.get('provider', 'cd2')
+    if provider == 'none':
+        raise ValueError('未配置可选的直链服务。可直接选择「挂载路径」生成 STRM')
+    if provider == 'template':
+        path = cloud_path(local, config)
+        template = config.get('url_template', '')
+        if '{path}' not in template:
+            raise ValueError('HTTP 地址模板需要包含 {path}')
+        return valid_url(template.replace('{path}', quote(path, safe='/')))
+    if provider == 'openlist':
+        path = cloud_path(local, config)
+        origin = config['openlist_url'].rstrip('/')
+        info = json_api(origin, '/api/fs/get', {'path': path, 'password': ''}, openlist_token(config), user_agent)
+        direct = valid_url(info.get('raw_url', ''))
+        parsed, base = urlsplit(direct), urlsplit(origin)
+        if parsed.netloc == base.netloc and parsed.path.startswith(('/p/', '/proxy/')):
+            raise ValueError('当前存储开启了代理，无法提供网盘直链；请在存储设置中关闭 Web 代理')
+        return direct
+    if provider != 'cd2':
+        raise ValueError('未知的直链连接方式')
+    return resolve_cd2(local, config, user_agent)
+
+
+def test_connection(config):
+    provider = config.get('provider', 'cd2')
+    if provider == 'openlist':
+        json_api(config['openlist_url'], '/api/fs/list', {'path': '/', 'page': 1, 'per_page': 1}, openlist_token(config))
+        return '文件服务已连接。扫描文件夹不依赖此连接'
+    if provider == 'cd2':
+        rpc(config['cd2_url'], 'GetSystemInfo')
+        return 'CD2 服务已连接'
+    if provider == 'template':
+        valid_url(config.get('url_template', '').replace('{path}', '/test'))
+        return '地址模板有效。请选择视频测试实际跳转'
+    return '独立文件夹模式，无需连接其他容器'
+
+
+def resolve_cd2(local, config, user_agent=''):
     path = cloud_path(local, config)
     origin = config['cd2_url'].rstrip('/')
     token = cd2_token(config)

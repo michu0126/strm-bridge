@@ -101,9 +101,17 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(r['errors']); self.assertEqual((self.dst / 'movie.strm').read_text(), 'existing')
     def test_source_change_after_preview_blocks_action(self):
         video = self.file('movie.mkv')
-        p = make_plan(self.options, self.config); video.write_bytes(b'changed')
+        p = make_plan(self.options, self.config); video.write_bytes(b'changed content')
         r = execute(p, self.config, lambda p: 'unused')
         self.assertTrue(r['errors']); self.assertFalse((self.dst / 'movie.strm').exists())
+    def test_same_size_change_with_modified_timestamp_blocks_action(self):
+        video=self.file('movie.mkv',b'old')
+        plan=make_plan(self.options,self.config)
+        old=video.stat().st_mtime
+        video.write_bytes(b'new');os.utime(video,(old+2,old+2))
+        result=execute(plan,self.config,lambda p:'unused')
+        self.assertTrue(result['errors'])
+        self.assertFalse((self.dst/'movie.strm').exists())
     def test_generation_error_prevents_cleanup(self):
         self.file('movie.mkv'); junk = self.file('junk.txt')
         (self.dst / 'movie.strm').write_text('existing')
@@ -140,8 +148,33 @@ class CoreTests(unittest.TestCase):
     def test_expired_plan_requires_preview(self):
         p = make_plan(self.options, self.config); p['created'] -= 3700
         with self.assertRaises(ValueError): execute(p, self.config, lambda p: 'unused')
+    def test_folder_mode_requires_no_cloud_service_or_mapping(self):
+        self.file('independent.mkv')
+        self.config.update(provider='none', default_mode='path', mappings=[])
+        opts=dict(self.options,mode='path')
+        plan=make_plan(opts,self.config)
+        with patch('bridge.resolver.rpc',side_effect=AssertionError('Cloud API must not be called')):
+            result=execute(plan,self.config,lambda p: (_ for _ in ()).throw(AssertionError('No playback adapter needed')))
+        self.assertEqual(result['created'],1)
+        self.assertEqual((self.dst/'independent.strm').read_text().strip(),str((self.src/'independent.mkv').resolve()))
 
 class ResolverTests(unittest.TestCase):
+    def test_openlist_maps_path_and_preserves_player_agent(self):
+        with tempfile.TemporaryDirectory() as t:
+            c={'provider':'openlist','openlist_url':'http://files:5244','openlist_token':'test','mappings':[{'local':t,'cloud':'/115'}]}
+            with patch('bridge.resolver.json_api',return_value={'raw_url':'https://cdn.example/file'}) as call:
+                self.assertEqual(resolve(Path(t)/'片名 #.mkv',c,'PlayerUA'),'https://cdn.example/file')
+                self.assertEqual(call.call_args.args[2]['path'],'/115/片名 #.mkv')
+                self.assertEqual(call.call_args.args[4],'PlayerUA')
+    def test_openlist_does_not_claim_proxy_url_is_direct(self):
+        with tempfile.TemporaryDirectory() as t:
+            c={'provider':'openlist','openlist_url':'http://files:5244','mappings':[{'local':t,'cloud':'/115'}]}
+            with patch('bridge.resolver.json_api',return_value={'raw_url':'http://files:5244/p/115/file.mkv'}):
+                with self.assertRaisesRegex(ValueError,'代理'):resolve(Path(t)/'file.mkv',c)
+    def test_http_template_quotes_special_filename_characters(self):
+        with tempfile.TemporaryDirectory() as t:
+            c={'provider':'template','url_template':'https://files.example/d{path}','mappings':[{'local':t,'cloud':'/115'}]}
+            self.assertEqual(resolve(Path(t)/'a #&.mkv',c),'https://files.example/d/115/a%20%23%26.mkv')
     def test_varint_unicode_roundtrip(self):
         self.assertEqual(fields(string_field(1, '电影'*200))[1][0].decode(), '电影'*200)
     def test_direct_url_field_and_request_flag(self):
@@ -187,8 +220,13 @@ class ServerTests(unittest.TestCase):
     def test_api_requires_auth(self): self.assertEqual(self.request('/api/config')[0],401)
     def test_config_does_not_expose_secret(self):
         self.state.config['cd2_token']='sensitive'
+        self.state.config['openlist_password']='openlist-sensitive'
         status,_,body=self.request('/api/config',headers=self.login())
         self.assertEqual(status,200);self.assertNotIn(b'sensitive',body)
+    def test_save_independent_settings_without_cd2_or_mapping(self):
+        status,_,body=self.request('/api/config',{'provider':'none','default_mode':'path','cd2_url':'','mappings':[]},self.login())
+        self.assertEqual(status,200,body)
+        self.assertEqual(self.state.config['mappings'],[])
     def test_csrf_rejected(self):
         h=dict(self.login(),Origin='http://evil.invalid')
         self.assertEqual(self.request('/api/config',{},h)[0],403)

@@ -94,13 +94,15 @@ def make_plan(options, config, cancel=lambda: False):
         raise ValueError('仅 JAV 支持小文件清理')
     if options.get('subtitle_mode', 'copy') not in ('copy', 'move'):
         raise ValueError('字幕处理方式无效')
-    mode = options.get('mode', 'redirect')
+    mode = options.get('mode', config.get('default_mode', 'path'))
     if mode not in ('redirect', 'path'):
         raise ValueError('播放方式无效')
     if mode == 'redirect':
         from .resolver import cloud_path, valid_url
         valid_url(config['public_url'])
         cloud_path(src, config)
+        if config.get('provider') == 'none':
+            raise ValueError('尚未配置可选直链服务，请选择「挂载路径」即可独立生成')
     files = list(walk(src, cancel))
     ext = media_extensions(options.get('extra_extensions', ''))
     videos = [p for p in files if p.suffix.lower().lstrip('.') in ext]
@@ -140,7 +142,7 @@ def make_plan(options, config, cancel=lambda: False):
             # No video, no cleanup. Every recognized video is protected regardless of size.
             if p.parent in parents and p not in videos and p.suffix.lower() != '.strm' and p.stat().st_size < 100_000_000:
                 actions.append({'type': 'trash', 'source': str(p), 'signature': signature(p)})
-    return {'id': uuid.uuid4().hex, 'created': time.time(), 'options': dict(options, source=str(src), target=str(dst)),
+    return {'id': uuid.uuid4().hex, 'created': time.time(), 'options': dict(options, source=str(src), target=str(dst), mode=mode),
             'actions': actions, 'warnings': warnings, 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
             'config_fingerprint': config_fingerprint(config)}
 

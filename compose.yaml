@@ -10,12 +10,11 @@ services:
       TZ: Asia/Shanghai
       AUTH_DISABLED: ${AUTH_DISABLED:-0}
       PUBLIC_URL: ${PUBLIC_URL:-http://192.168.50.13:18642}
-      CD2_URL: ${CD2_URL:-http://192.168.50.13:19798}
       SOURCE_ROOTS: '["/cloud"]'
       TARGET_ROOTS: '["/library/video","/library/VIDEO2"]'
     volumes:
       - ./data:/data
-      - /volume1/docker/clouddrive2/mount:/cloud:rw,rslave
+      - ${SOURCE_DIR:-/mnt/cloud}:/cloud:rw,rslave
       - /volume1/video:/library/video:rw
       - /volume2/VIDEO2:/library/VIDEO2:rw
     mem_limit: 384m

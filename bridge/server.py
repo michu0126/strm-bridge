@@ -17,7 +17,8 @@ import uuid
 
 from . import __version__
 from .core import VIDEO, SUB, SKIP_DIRS, inside, make_plan, execute
-from .resolver import valid_url, resolve, rpc, cd2_token
+from .resolver import valid_url, resolve, test_connection
+from .watcher import Watcher
 
 STATIC = Path(__file__).parent.parent / 'static'
 
@@ -39,9 +40,14 @@ class State:
             'source_roots': json.loads(os.environ.get('SOURCE_ROOTS', '["/cloud"]')),
             'target_roots': json.loads(os.environ.get('TARGET_ROOTS', '["/library"]')),
             'public_url': os.environ.get('PUBLIC_URL', 'http://localhost:18642'),
-            'cd2_url': os.environ.get('CD2_URL', 'http://host.docker.internal:19798'),
+            'provider': 'none', 'default_mode': 'path',
+            'openlist_url': '', 'openlist_user': '', 'openlist_password': '', 'openlist_token': '',
+            'url_template': '',
+            'cd2_url': os.environ.get('CD2_URL', ''),
             'cd2_token': '', 'cd2_user': '', 'cd2_password': '',
-            'mappings': [{'local': '/cloud/115', 'cloud': '/115open'}]}
+            'mappings': []}
+        self.config.setdefault('provider', 'cd2' if self.config.get('cd2_url') else 'none')
+        self.config.setdefault('default_mode', 'redirect' if self.config['provider'] != 'none' else 'path')
         if not self.config_path.exists():
             self.save_config()
         for row in self.db.execute('SELECT id,value FROM jobs').fetchall():
@@ -49,6 +55,7 @@ class State:
             if j['status'] in ('running', 'scanning', 'queued'):
                 j.update(status='interrupted', error='服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
                 self.put_job(j)
+        self.watcher = Watcher(self)
 
     def secret(self, name):
         p = self.data / name
@@ -247,8 +254,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.respond({'error': '请登录'}, 401)
             if path == '/api/config':
-                config = {k: v for k, v in self.state.config.items() if k not in ('cd2_token', 'cd2_password')}
+                secret_keys = ('cd2_token', 'cd2_password', 'openlist_token', 'openlist_password')
+                config = {k: v for k, v in self.state.config.items() if k not in secret_keys}
                 config.update(cd2_token_set=bool(self.state.config.get('cd2_token')), cd2_password_set=bool(self.state.config.get('cd2_password')))
+                config.update(openlist_token_set=bool(self.state.config.get('openlist_token')), openlist_password_set=bool(self.state.config.get('openlist_password')))
                 return self.respond(dict(config=config, video_extensions=sorted(VIDEO), subtitle_extensions=sorted(SUB), version=__version__))
             if path == '/api/browse':
                 kind = query.get('kind', ['source'])[0]
@@ -263,6 +272,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({'roots': roots, 'path': str(p), 'parent': str(p.parent) if str(p) not in roots else '', 'directories': sorted(directories, key=lambda d: d['name'].casefold())})
             if path == '/api/jobs':
                 return self.respond(self.state.jobs())
+            if path == '/api/watches':
+                return self.respond(self.state.watcher.list())
             if path.startswith('/api/jobs/'):
                 job = self.state.job(path.rsplit('/', 1)[-1])
                 if 'plan' in job:
@@ -319,6 +330,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({'ok': True}, headers={'Set-Cookie': 'session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'})
         if self.path == '/api/scan':
             return self.respond(self.state.start_scan(data), 202)
+        if self.path == '/api/watches':
+            return self.respond(self.state.watcher.save(data))
+        if self.path == '/api/watches/delete':
+            return self.respond(self.state.watcher.delete(data['id']))
+        if self.path == '/api/watches/check':
+            with self.state.lock:
+                watch = next((w for w in self.state.watcher.list() if w['id'] == data['id']), None)
+                if not watch:
+                    raise ValueError('监控不存在')
+                if not watch['enabled']:
+                    raise ValueError('请先启用监控')
+                watch['next_run'] = 0
+                self.state.watcher.put(watch)
+            return self.respond({'ok': True})
         if self.path == '/api/run':
             return self.respond(self.state.run(data['id']), 202)
         if self.path == '/api/cancel':
@@ -331,33 +356,44 @@ class Handler(BaseHTTPRequestHandler):
                 if self.state.busy:
                     raise ValueError('任务运行时不能修改设置')
                 c = dict(self.state.config)
-                for k in ('public_url', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
+                for k in ('public_url', 'provider', 'default_mode', 'openlist_url', 'openlist_user', 'openlist_password', 'openlist_token', 'url_template', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
                     if k in data:
                         c[k] = data[k]
                 valid_url(c['public_url'])
-                valid_url(c['cd2_url'])
-                if not isinstance(c['mappings'], list) or not c['mappings']:
-                    raise ValueError('至少需要一个路径映射')
+                if c.get('provider') not in ('none', 'openlist', 'template', 'cd2'):
+                    raise ValueError('直链连接方式无效')
+                if c.get('default_mode') not in ('path', 'redirect'):
+                    raise ValueError('默认播放入口无效')
+                if c['provider'] == 'cd2':
+                    valid_url(c.get('cd2_url', ''))
+                elif c['provider'] == 'openlist':
+                    valid_url(c.get('openlist_url', ''))
+                elif c['provider'] == 'template':
+                    if '{path}' not in c.get('url_template', ''):
+                        raise ValueError('HTTP 地址模板需要包含 {path}')
+                    valid_url(c['url_template'].replace('{path}', '/test'))
+                if not isinstance(c.get('mappings'), list):
+                    raise ValueError('路径映射必须是列表；仅生成挂载路径时可留空列表 []')
                 for m in c['mappings']:
                     inside(m['local'], c['source_roots'])
                     if not isinstance(m['cloud'], str) or not m['cloud'].startswith('/') or '..' in m['cloud'].split('/'):
-                        raise ValueError('CD2 路径必须以 / 开头，不能包含 ..')
+                        raise ValueError('服务端路径必须以 / 开头，不能包含 ..')
                 self.state.config = c
                 self.state.save_config()
             return self.respond({'ok': True})
-        if self.path == '/api/test-cd2':
+        if self.path in ('/api/test-connection', '/api/test-cd2'):
             if data.get('path'):
                 p = inside(data['path'], self.state.config['source_roots'])
                 location = resolve(p, dict(self.state.config), self.headers.get('User-Agent', ''))
                 return self.respond({'ok': True, 'host': urlsplit(location).hostname, 'message': '已获得 302 直链（未下载正片）'})
-            rpc(self.state.config['cd2_url'], 'GetSystemInfo')
-            return self.respond({'ok': True, 'message': 'CD2 服务已连接。请选择一个视频文件测试真实直链。'})
+            return self.respond({'ok': True, 'message': test_connection(dict(self.state.config))})
         return self.respond({'error': '接口不存在'}, 404)
 
 def main():
     state = State(os.environ.get('DATA_DIR', '/data'))
     server = ThreadingHTTPServer((os.environ.get('BIND_HOST', '0.0.0.0'), int(os.environ.get('PORT', '18642'))), Handler)
     server.state = state
+    state.watcher.start()
     print('STRM Bridge ' + __version__ + ' is ready. Admin password: ' + str(state.data / 'admin-password.txt'), flush=True)
     server.serve_forever()
 
