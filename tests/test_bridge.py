@@ -230,6 +230,20 @@ class ServerTests(unittest.TestCase):
     def test_csrf_rejected(self):
         h=dict(self.login(),Origin='http://evil.invalid')
         self.assertEqual(self.request('/api/config',{},h)[0],403)
+    def test_wallpaper_upload_requires_auth_and_serves_image_bytes(self):
+        from test_appearance import PNG
+        def upload(headers):
+            c=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=3)
+            c.request('POST','/api/appearance/upload',PNG,{'Content-Type':'image/png',**headers})
+            r=c.getresponse();status=r.status;body=r.read();c.close();return status,body
+        self.assertEqual(upload({})[0],401)
+        headers=self.login();status,body=upload(headers)
+        self.assertEqual(status,200,body)
+        path=json.loads(body)['url']
+        status,response_headers,body=self.request(path,headers=headers)
+        self.assertEqual(status,200);self.assertEqual(body,PNG)
+        self.assertEqual(response_headers['Content-Type'],'image/png')
+        self.assertEqual(upload(dict(headers,Origin='http://evil.invalid'))[0],403)
     def test_stable_capability_url_and_tamper_rejection(self):
         path=Path(self.temp.name)/'video.mkv'
         self.assertEqual(self.state.playback(path), self.state.playback(path))

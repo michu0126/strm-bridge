@@ -19,6 +19,7 @@ from . import __version__
 from .core import VIDEO, SUB, SKIP_DIRS, inside, make_plan, execute
 from .resolver import valid_url, resolve, test_connection
 from .watcher import Watcher
+from .appearance import Wallpapers, MAX_IMAGE
 
 STATIC = Path(__file__).parent.parent / 'static'
 
@@ -56,6 +57,7 @@ class State:
                 j.update(status='interrupted', error='服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
                 self.put_job(j)
         self.watcher = Watcher(self)
+        self.wallpapers = Wallpapers(self.data)
 
     def secret(self, name):
         p = self.data / name
@@ -259,6 +261,13 @@ class Handler(BaseHTTPRequestHandler):
                 config.update(cd2_token_set=bool(self.state.config.get('cd2_token')), cd2_password_set=bool(self.state.config.get('cd2_password')))
                 config.update(openlist_token_set=bool(self.state.config.get('openlist_token')), openlist_password_set=bool(self.state.config.get('openlist_password')))
                 return self.respond(dict(config=config, video_extensions=sorted(VIDEO), subtitle_extensions=sorted(SUB), version=__version__))
+            if path == '/api/appearance':
+                return self.respond(self.state.wallpapers.status())
+            if path == '/api/appearance/bing':
+                return self.respond(self.state.wallpapers.bing())
+            if path.startswith('/api/appearance/image/'):
+                data, mime = self.state.wallpapers.image(path.rsplit('/', 1)[-1])
+                return self.respond(data, content_type=mime)
             if path == '/api/browse':
                 kind = query.get('kind', ['source'])[0]
                 roots = self.state.config['source_roots' if kind == 'source' else 'target_roots']
@@ -283,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css'):
+        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
@@ -304,6 +313,13 @@ class Handler(BaseHTTPRequestHandler):
                                 urlsplit(origin).hostname == urlsplit('http://' + host).hostname)
         if origin and urlsplit(origin).netloc != host and not metadata_same_origin:
             return self.respond({'error': '跨站请求已拒绝'}, 403)
+        if self.path == '/api/appearance/upload':
+            if not self.authorized():
+                return self.respond({'error': '请登录'}, 401)
+            size = int(self.headers.get('Content-Length', '0'))
+            if not 0 < size <= MAX_IMAGE:
+                return self.respond({'error': '背景图片需要在 10MB 以内'}, 413)
+            return self.respond(self.state.wallpapers.upload(self.rfile.read(size)))
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
             return self.respond({'error': '需要 JSON 请求'}, 415)
         length = int(self.headers.get('Content-Length', '0'))
