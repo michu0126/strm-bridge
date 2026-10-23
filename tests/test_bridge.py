@@ -159,6 +159,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((self.dst/'independent.strm').read_text().strip(),str((self.src/'independent.mkv').resolve()))
 
 class ResolverTests(unittest.TestCase):
+    def test_auto_path_uses_mount_relative_path_without_mapping(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = {'source_roots': [t], 'mappings': []}
+            self.assertEqual(cloud_path(Path(t) / '115' / '片名 #.mkv', c), '/115/片名 #.mkv')
+            self.assertEqual(cloud_path(Path(t), c), '/')
+
+    def test_auto_path_uses_most_specific_mount(self):
+        with tempfile.TemporaryDirectory() as t:
+            nested = Path(t) / 'second'
+            c = {'source_roots': [t, str(nested)]}
+            self.assertEqual(cloud_path(nested / 'movie.mkv', c), '/movie.mkv')
+
+    def test_custom_path_takes_precedence_over_automatic_root(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = {'source_roots': [t], 'mappings': [{'local': t, 'cloud': '/115/Movies'}]}
+            self.assertEqual(cloud_path(Path(t) / 'a.mkv', c), '/115/Movies/a.mkv')
+
+    def test_auto_path_rejects_files_outside_mounts(self):
+        with tempfile.TemporaryDirectory() as t:
+            with self.assertRaises(ValueError):
+                cloud_path(Path(t) / 'sibling' / 'a.mkv', {'source_roots': [str(Path(t) / 'cloud')]})
+
     def test_openlist_maps_path_and_preserves_player_agent(self):
         with tempfile.TemporaryDirectory() as t:
             c={'provider':'openlist','openlist_url':'http://files:5244','openlist_token':'test','mappings':[{'local':t,'cloud':'/115'}]}

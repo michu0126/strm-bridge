@@ -389,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('HTTP 地址模板需要包含 {path}')
                     valid_url(c['url_template'].replace('{path}', '/test'))
                 if not isinstance(c.get('mappings'), list):
-                    raise ValueError('路径映射必须是列表；仅生成挂载路径时可留空列表 []')
+                    raise ValueError('目录对应设置无效')
                 for m in c['mappings']:
                     inside(m['local'], c['source_roots'])
                     if not isinstance(m['cloud'], str) or not m['cloud'].startswith('/') or '..' in m['cloud'].split('/'):

@@ -19,8 +19,16 @@ def cloud_path(local, config):
     for m in mappings:
         root = Path(m['local']).resolve()
         if p.is_relative_to(root):
-            return '/' + str(PurePosixPath(m['cloud'].lstrip('/')) / p.relative_to(root).as_posix()).strip('/')
-    raise ValueError('未配置此挂载路径对应的直链目录；仅生成挂载路径时无需此设置')
+            return str(PurePosixPath('/') / m['cloud'].lstrip('/') / p.relative_to(root).as_posix())
+    # A mount of the file service root has the same relative paths as the API.
+    # Explicit overrides above still cover mounts of individual subdirectories.
+    roots = sorted((Path(r).resolve() for r in config.get('source_roots', [])),
+                   key=lambda r: len(r.parts), reverse=True)
+    for root in roots:
+        if p.is_relative_to(root):
+            relative = p.relative_to(root).as_posix()
+            return '/' if relative == '.' else '/' + relative
+    raise ValueError('文件不在已配置的挂载目录中')
 
 def varint(n):
     data = bytearray()
