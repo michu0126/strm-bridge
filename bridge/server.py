@@ -20,6 +20,9 @@ from .core import VIDEO, SUB, SKIP_DIRS, inside, make_plan, execute
 from .resolver import valid_url, resolve, test_connection
 from .watcher import Watcher
 from .appearance import Wallpapers, MAX_IMAGE
+from .cloud import Clouds, is_cloud
+from .cloud_providers import CATALOG
+from .cloud_login import CloudLogin
 
 STATIC = Path(__file__).parent.parent / 'static'
 
@@ -56,6 +59,8 @@ class State:
             if j['status'] in ('running', 'scanning', 'queued'):
                 j.update(status='interrupted', error='服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
                 self.put_job(j)
+        self.clouds = Clouds(self)
+        self.cloud_login = CloudLogin()
         self.watcher = Watcher(self)
         self.wallpapers = Wallpapers(self.data)
 
@@ -98,11 +103,21 @@ class State:
         return hmac.new(self.key.encode(), media_id.encode(), hashlib.sha256).hexdigest()
 
     def playback(self, p):
-        media_id = hashlib.sha256(str(p).encode()).hexdigest()[:32]
+        remote = isinstance(p, dict)
+        identity = ('cloud:' + p['account'] + ':' + str(p['object'].get('fsid', p['object']['id']))) if remote else str(p)
+        stored = 'cloud:' + json.dumps(p, ensure_ascii=False) if remote else str(p)
+        media_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
         with self.lock:
-            self.db.execute('INSERT OR REPLACE INTO media VALUES(?,?)', (media_id, str(p)))
+            self.db.execute('INSERT OR REPLACE INTO media VALUES(?,?)', (media_id, stored))
             self.db.commit()
-        return self.config['public_url'].rstrip('/') + '/play/' + media_id + '/' + self.sign(media_id) + '/' + quote(p.name, safe='')
+        return self.config['public_url'].rstrip('/') + '/play/' + media_id + '/' + self.sign(media_id) + '/' + quote(p['object']['name'] if remote else p.name, safe='')
+
+    def make_plan(self, options, config, cancel=lambda: False):
+        return self.clouds.plan(options, config, cancel) if is_cloud(options['source']) else make_plan(options, config, cancel)
+
+    def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
+        runner = self.clouds.execute if 'account' in plan else execute
+        return runner(plan, config, playback, progress, cancel, journal)
 
     def start_scan(self, options):
         with self.lock:
@@ -115,7 +130,7 @@ class State:
         self.put_job(job)
         def work():
             try:
-                plan = make_plan(options, config, lambda: job_id in self.cancelled)
+                plan = self.make_plan(options, config, lambda: job_id in self.cancelled)
                 job.update(status='preview', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
             except Exception as e:
                 job.update(status='cancelled' if job_id in self.cancelled else 'failed', error=str(e))
@@ -142,7 +157,7 @@ class State:
             self.put_job(job)
         def work():
             try:
-                result = execute(job['plan'], config, self.playback, progress,
+                result = self.execute(job['plan'], config, self.playback, progress,
                                  lambda: job_id in self.cancelled,
                                  lambda kind, value: self.journal(job_id, kind, value))
                 job.update(status='cancelled' if result['cancelled'] else ('partial' if result['errors'] else 'completed'), result=result)
@@ -160,6 +175,16 @@ class State:
             if self.busy:
                 raise ValueError('请等待当前任务完成')
             job = self.job(job_id)
+            if 'account' in job['plan']:
+                # Network requests must not hold the SQLite/state lock.
+                self.busy = 'restore:' + job_id
+        if 'account' in job['plan']:
+            try:
+                return self.clouds.restore(job_id)
+            finally:
+                with self.lock:
+                    self.busy = None
+        with self.lock:
             root = inside(job['plan']['options']['source'], self.config['source_roots'])
             trash_root = root / '.strm-trash' / job['plan']['id']
             rows = self.db.execute("SELECT value FROM journal WHERE job=? AND kind IN ('trash','pending_trash')", (job_id,)).fetchall()
@@ -215,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://qrcodeapi.115.com; frame-ancestors 'none'; base-uri 'none'")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -246,9 +271,12 @@ class Handler(BaseHTTPRequestHandler):
                 row = self.state.db.execute('SELECT path FROM media WHERE id=?', (parts[2],)).fetchone()
             if not row:
                 return self.respond({'error': '影片记录不存在'}, 404)
-            p = inside(row[0], self.state.config['source_roots'])
             try:
-                location = resolve(p, dict(self.state.config), self.headers.get('User-Agent', ''))
+                if row[0].startswith('cloud:'):
+                    location = self.state.clouds.resolve(json.loads(row[0][6:]), self.headers.get('User-Agent', ''))
+                else:
+                    p = inside(row[0], self.state.config['source_roots'])
+                    location = resolve(p, dict(self.state.config), self.headers.get('User-Agent', ''))
                 return self.respond(b'', 302, 'application/octet-stream', {'Location': location})
             except Exception as e:
                 return self.respond({'error': str(e)}, 502)
@@ -263,6 +291,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(dict(config=config, video_extensions=sorted(VIDEO), subtitle_extensions=sorted(SUB), version=__version__))
             if path == '/api/appearance':
                 return self.respond(self.state.wallpapers.status())
+            if path == '/api/clouds':
+                return self.respond({'providers': CATALOG, 'accounts': self.state.clouds.list_accounts()})
             if path == '/api/appearance/bing':
                 return self.respond(self.state.wallpapers.bing())
             if path.startswith('/api/appearance/image/'):
@@ -272,8 +302,11 @@ class Handler(BaseHTTPRequestHandler):
                 kind = query.get('kind', ['source'])[0]
                 roots = self.state.config['source_roots' if kind == 'source' else 'target_roots']
                 requested = query.get('path', [''])[0]
+                if kind == 'source' and is_cloud(requested):
+                    return self.respond(self.state.clouds.browse(requested))
                 if not requested:
-                    return self.respond({'roots': roots, 'path': '', 'directories': [{'name': r, 'path': r} for r in roots]})
+                    cloud_dirs = [{'name': a['name'], 'path': a['source']} for a in self.state.clouds.list_accounts()] if kind == 'source' else []
+                    return self.respond({'roots': roots, 'path': '', 'directories': cloud_dirs + [{'name': r, 'path': r} for r in roots]})
                 p = inside(requested, roots)
                 if not p.is_dir():
                     raise ValueError('目录不存在或挂载未就绪')
@@ -292,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css'):
+        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'logo.svg'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
@@ -346,6 +379,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({'ok': True}, headers={'Set-Cookie': 'session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'})
         if self.path == '/api/scan':
             return self.respond(self.state.start_scan(data), 202)
+        if self.path == '/api/clouds/login/start':
+            return self.respond(self.state.cloud_login.start(data.get('provider')))
+        if self.path == '/api/clouds/login/status':
+            return self.respond(self.state.cloud_login.status(data.get('id')))
+        if self.path in ('/api/clouds/save', '/api/clouds/delete', '/api/clouds/test'):
+            if self.state.busy:
+                raise ValueError('请等待当前任务完成')
+            if self.path.endswith('/save'):
+                return self.respond(self.state.clouds.save(data))
+            if self.path.endswith('/delete'):
+                return self.respond(self.state.clouds.delete(data['id']))
+            return self.respond(self.state.clouds.test(data['id']))
         if self.path == '/api/watches':
             return self.respond(self.state.watcher.save(data))
         if self.path == '/api/watches/delete':

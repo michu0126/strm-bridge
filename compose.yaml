@@ -1,22 +1,22 @@
 services:
   strm-bridge:
     image: michu0126/strm-bridge:latest
-    build: .
     container_name: strm-bridge
     restart: unless-stopped
     ports:
-      - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-18642}:18642"
+      - "${HOST_PORT:-18642}:18642"
     environment:
       TZ: Asia/Shanghai
       AUTH_DISABLED: ${AUTH_DISABLED:-0}
-      PUBLIC_URL: ${PUBLIC_URL:-http://192.168.50.13:18642}
-      SOURCE_ROOTS: '["/cloud"]'
-      TARGET_ROOTS: '["/library/video","/library/VIDEO2"]'
+      PUBLIC_URL: ${PUBLIC_URL:-http://NAS-IP:18642}
+      SOURCE_ROOTS: '[]'
+      TARGET_ROOTS: '["/library"]'
     volumes:
       - ./data:/data
-      - ${SOURCE_DIR:-/mnt/cloud}:/cloud:rw,rslave
-      - /volume1/video:/library/video:rw
-      - /volume2/VIDEO2:/library/VIDEO2:rw
+      # 在项目同目录的 .env 中填写 LIBRARY_DIR，为 NAS 上的 Emby 媒体库目录。
+      - ${LIBRARY_DIR:?请在 .env 填写媒体库路径 LIBRARY_DIR}:/library:rw
+      # 可选：继续使用本地挂载源时，增加卷，并把 SOURCE_ROOTS 改为 '["/cloud"]'。
+      # - /你的挂载目录:/cloud:rw,rslave
     mem_limit: 384m
     security_opt:
       - no-new-privileges:true

@@ -6,6 +6,7 @@ import time
 import uuid
 
 from .core import inside, make_plan, execute, media_extensions
+from .cloud import is_cloud, parse_uri
 
 
 class Watcher:
@@ -41,11 +42,17 @@ class Watcher:
                     state.cancelled.add(state.busy)
             else:
                 options = dict(data['options'])
-                source = inside(options['source'], state.config['source_roots'])
+                remote = is_cloud(options['source'])
+                source = options['source'] if remote else inside(options['source'], state.config['source_roots'])
                 target = inside(options['target'], state.config['target_roots'])
-                if not source.is_dir() or not target.is_dir():
+                if remote:
+                    account, identifier = parse_uri(source)
+                    if not state.clouds.node(account, identifier)['folder']:
+                        raise ValueError('请选择网盘文件夹')
+                    options['mode'] = 'redirect'
+                if (not remote and not source.is_dir()) or not target.is_dir():
                     raise ValueError('请选择已挂载的源目录和已存在的媒体库目录')
-                if source.is_relative_to(target) or target.is_relative_to(source):
+                if not remote and (source.is_relative_to(target) or target.is_relative_to(source)):
                     raise ValueError('源目录和目标目录不能互相包含')
                 if options.get('kind') not in ('movie', 'tv', 'jav') or options.get('mode') not in ('path', 'redirect'):
                     raise ValueError('监控的媒体类型或播放入口无效')
@@ -94,12 +101,12 @@ class Watcher:
         recorded = False
         cancel = lambda: self.stop.is_set() or job_id in state.cancelled
         try:
-            plan = make_plan(watch['options'], config, cancel)
+            plan = state.make_plan(watch['options'], config, cancel)
             # Additions only: never move, clean up, rewrite or delete an existing file.
             # A recently modified source is retried on the next pass.
             plan['actions'] = [a for a in plan['actions'] if a['type'] in ('strm', 'copy')
                                and not Path(a['target']).exists()
-                               and Path(a['source']).stat().st_mtime <= time.time() - 60]
+                               and (a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime) <= time.time() - 60]
             plan['counts'] = {k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash')}
             if plan['actions']:
                 job.update(status='running', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
@@ -108,7 +115,7 @@ class Watcher:
                 def progress(done, total, current):
                     job.update(done=done, total=total, current=current)
                     state.put_job(job)
-                result = execute(plan, config, state.playback, progress, cancel)
+                result = state.execute(plan, config, state.playback, progress, cancel)
                 job.update(status='cancelled' if result['cancelled'] else ('partial' if result['errors'] else 'completed'), result=result)
                 watch.update(last_status=job['status'], last_job=job_id, last_result=result,
                              last_error='；'.join(e['message'] for e in result['errors'][:3]))
