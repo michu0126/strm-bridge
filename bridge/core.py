@@ -11,6 +11,7 @@ import uuid
 VIDEO = set(('3g2 3gp 3gp2 3gpp amv asf avi avs bdav bik bink dat divx dpg dv evo f4v flc fli flv h264 h265 hdmov hevc img iso ivf m1v m2p m2t m2ts m2v m4v m4p mk3d mkv mov mp2v mp4 mpe mpeg mpg mpv mts mxf nsv nut ogm ogv ogx qt ram rec rm rmvb rpl smk svi tod tp trp ts vdr vob vro webm wm wmv wtv xvid y4m').split())
 SUB = set('srt ass ssa sub idx vtt sup smi sami txt ttml dfxp sbv scc stl lrc usf aqt jss mpl pjs rt sst tts'.split())
 SKIP_DIRS = {'.strm-trash', '.snapshot', '#recycle', '@eaDir', '$RECYCLE.BIN', '.git', 'lost+found'}
+CLEANUP_LIMIT = 100_000_000
 EPISODE = re.compile(r'(?:s(\d{1,3})[ ._-]*e(\d{1,4})(?!\d)|(\d{1,3})x(\d{1,4})(?!\d))', re.I)
 
 def inside(path, roots):
@@ -106,6 +107,13 @@ def make_plan(options, config, cancel=lambda: False):
     files = list(walk(src, cancel))
     ext = media_extensions(options.get('extra_extensions', ''))
     videos = [p for p in files if p.suffix.lower().lstrip('.') in ext]
+    cleanup_files = []
+    if cleanup:
+        # Determine the media folders before filtering small video advertisements.
+        parents = {v.parent for v in videos}
+        cleanup_files = [p for p in files if p.parent in parents and p.stat().st_size < CLEANUP_LIMIT]
+        cleanup_set = set(cleanup_files)
+        videos = [v for v in videos if v not in cleanup_set]
     actions, warnings, used = [], [], set()
     targets = {}
     for v in videos:
@@ -136,12 +144,8 @@ def make_plan(options, config, cancel=lambda: False):
                 raise ValueError('字幕目标文件冲突：' + str(out))
             used.add(out)
             actions.append({'type': options.get('subtitle_mode', 'copy'), 'source': str(p), 'target': str(out), 'signature': signature(p)})
-    if cleanup:
-        parents = {v.parent for v in videos}
-        for p in files:
-            # No video, no cleanup. Every recognized video is protected regardless of size.
-            if p.parent in parents and p not in videos and p.suffix.lower() != '.strm' and p.stat().st_size < 100_000_000:
-                actions.append({'type': 'trash', 'source': str(p), 'signature': signature(p)})
+    for p in cleanup_files:
+        actions.append({'type': 'trash', 'source': str(p), 'signature': signature(p)})
     return {'id': uuid.uuid4().hex, 'created': time.time(), 'options': dict(options, source=str(src), target=str(dst), mode=mode),
             'actions': actions, 'warnings': warnings, 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
             'config_fingerprint': config_fingerprint(config)}
@@ -184,7 +188,7 @@ def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda:
                     raise ValueError('生成发生错误，本次清理已停止')
                 if plan['options']['kind'] != 'jav' or not plan['options'].get('cleanup'):
                     raise ValueError('不允许清理')
-                if p.suffix.lower().lstrip('.') in media_extensions(plan['options'].get('extra_extensions', '')) or p.stat().st_size >= 100_000_000:
+                if p.stat().st_size >= CLEANUP_LIMIT:
                     raise ValueError('受保护文件')
                 trash = inside(src / '.strm-trash' / plan['id'] / p.relative_to(src), [src])
                 trash.parent.mkdir(parents=True, exist_ok=True)

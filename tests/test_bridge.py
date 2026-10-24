@@ -24,10 +24,12 @@ class CoreTests(unittest.TestCase):
         self.config = {'source_roots': [str(self.src)], 'target_roots': [str(self.dst)],
                        'public_url': 'http://nas:18642', 'mappings': [{'local': str(self.src), 'cloud': '/115open'}]}
         self.options = {'source': str(self.src), 'target': str(self.dst), 'kind': 'movie', 'mode': 'redirect'}
-    def file(self, name, content=b'content'):
+    def file(self, name, content=b'content', size=None):
         p = self.src / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(content)
+        if size is not None:
+            with p.open('r+b') as f: f.truncate(size)
         return p
     def run_plan(self, **kwargs):
         plan = make_plan(dict(self.options, **kwargs), self.config)
@@ -39,27 +41,46 @@ class CoreTests(unittest.TestCase):
         _, r = self.run_plan()
         self.assertEqual(r['created'], 1)
         self.assertTrue((self.dst / folder / '片名 #1.strm').exists())
-    def test_short_video_preserved_during_cleanup(self):
-        video = self.file('ABC-123.mp4', b'v')
+    def test_cleanup_includes_every_file_type_and_omits_small_video_strm(self):
+        video = self.file('ABC-123.mp4', size=100_000_000)
+        names = ['ad.MP4', 'ad.mkv', 'ad.weirdfmt', 'ad.url', 'ad.exe', 'ad.jpg',
+                 'ad.zip', 'ad.pdf', 'ad.srt', 'ad.nfo', 'ad.strm', 'ad.json', 'README']
+        junk = [self.file(name) for name in names]
+        plan, r = self.run_plan(kind='jav', cleanup=True, extra_extensions='weirdfmt')
+        self.assertTrue(video.exists())
+        self.assertEqual(r['created'], 1)
+        self.assertEqual(r['trashed'], len(junk))
+        self.assertEqual(r['errors'], [])
+        self.assertEqual({a['source'] for a in plan['actions'] if a['type'] == 'strm'}, {str(video.resolve())})
+        for p in junk:
+            self.assertFalse(p.exists())
+            self.assertTrue((self.src / '.strm-trash' / plan['id'] / p.name).exists())
+
+    def test_folder_with_only_small_videos_can_be_cleaned(self):
+        video = self.file('ad.mp4')
         junk = self.file('advertisement.url')
         plan, r = self.run_plan(kind='jav', cleanup=True)
-        self.assertTrue(video.exists()); self.assertFalse(junk.exists())
-        self.assertEqual(r['trashed'], 1)
+        self.assertFalse(video.exists()); self.assertFalse(junk.exists())
+        self.assertEqual(r['created'], 0)
+        self.assertEqual(r['trashed'], 2)
         self.assertTrue((self.src / '.strm-trash' / plan['id'] / junk.name).exists())
     def test_cleanup_default_off(self):
-        self.file('movie.mp4'); junk = self.file('other.txt')
+        video = self.file('movie.mp4'); junk = self.file('other.txt')
         _, r = self.run_plan(kind='jav')
         self.assertEqual(r['trashed'], 0); self.assertTrue(junk.exists())
+        self.assertTrue(video.exists()); self.assertEqual(r['created'], 1)
     def test_cleanup_forbidden_for_movies(self):
         with self.assertRaises(ValueError):
             self.run_plan(cleanup=True)
     def test_threshold_strictly_less_than_decimal_100mb(self):
-        self.file('movie.mkv'); big = self.file('large.bin')
-        with big.open('wb') as f: f.truncate(100_000_000)
+        video = self.file('movie.mkv', size=100_000_000)
+        big = self.file('large.bin', size=100_000_000)
+        small = self.file('ad.mp4', size=99_999_999)
         p, r = self.run_plan(kind='jav', cleanup=True)
-        self.assertEqual(r['trashed'], 0); self.assertTrue(big.exists())
+        self.assertEqual(r['trashed'], 1); self.assertTrue(big.exists()); self.assertTrue(video.exists())
+        self.assertFalse(small.exists()); self.assertEqual(r['created'], 1)
     def test_cleanup_does_not_touch_unrelated_directories(self):
-        self.file('one/movie.mp4'); other = self.file('two/document.txt')
+        self.file('one/movie.mp4', size=100_000_000); other = self.file('two/document.txt')
         _, r = self.run_plan(kind='jav', cleanup=True)
         self.assertTrue(other.exists()); self.assertEqual(r['trashed'], 0)
     def test_named_subtitle_preserves_language(self):
@@ -113,10 +134,21 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result['errors'])
         self.assertFalse((self.dst/'movie.strm').exists())
     def test_generation_error_prevents_cleanup(self):
-        self.file('movie.mkv'); junk = self.file('junk.txt')
+        self.file('movie.mkv', size=100_000_000); junk = self.file('junk.txt')
+        small_video = self.file('ad.mp4')
         (self.dst / 'movie.strm').write_text('existing')
         _, r = self.run_plan(kind='jav', cleanup=True)
         self.assertTrue(junk.exists()); self.assertEqual(r['trashed'], 0)
+        self.assertTrue(small_video.exists())
+
+    def test_small_video_changed_after_preview_is_not_cleaned(self):
+        video = self.file('ad.mp4')
+        plan = make_plan(dict(self.options, kind='jav', cleanup=True), self.config)
+        video.write_bytes(b'changed')
+        result = execute(plan, self.config, lambda p: 'unused')
+        self.assertTrue(video.exists())
+        self.assertEqual(result['trashed'], 0)
+        self.assertTrue(result['errors'])
     def test_reject_nested_source_and_target(self):
         self.config['target_roots'] = [str(self.src)]
         with self.assertRaises(ValueError): make_plan(dict(self.options, target=str(self.src)), self.config)
@@ -281,7 +313,8 @@ class ServerTests(unittest.TestCase):
     def test_restore_preserves_existing_original(self):
         src=Path(self.temp.name)/'cloud';dst=Path(self.temp.name)/'library';src.mkdir();dst.mkdir()
         self.state.config.update(source_roots=[str(src)],target_roots=[str(dst)],mappings=[{'local':str(src),'cloud':'/115'}])
-        (src/'movie.mkv').write_bytes(b'video');(src/'other.txt').write_bytes(b'old')
+        with (src/'movie.mkv').open('wb') as f: f.truncate(100_000_000)
+        (src/'other.txt').write_bytes(b'old')
         p=make_plan({'source':str(src),'target':str(dst),'kind':'jav','cleanup':True},self.state.config)
         self.state.put_job({'id':'j1','status':'running','plan':p})
         execute(p,self.state.config,self.state.playback,journal=lambda k,v:self.state.journal('j1',k,v))
