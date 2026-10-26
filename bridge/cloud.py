@@ -454,10 +454,12 @@ class Clouds:
         return {'restored': restored, 'errors': errors}
 
     def resolve(self, reference, agent):
+        # Download URLs may be bound to the player's UA, including its absence.
+        agent = agent or ''
         with self.client(reference['account']) as client:
-            url, headers = client.link(reference['object'], agent or 'STRMBridge/2.0')
+            url, headers = client.link(reference['object'], agent)
         required = headers.get('User-Agent')
-        if required and required != (agent or 'STRMBridge/2.0'):
+        if required is not None and required != agent:
             raise CloudError('此网盘要求播放器 User-Agent 为 ' + required)
         if any(k.lower() != 'user-agent' for k in headers):
             raise CloudError('此网盘下载需要额外请求头，无法通过普通 302 传递')

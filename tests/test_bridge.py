@@ -144,7 +144,9 @@ class CoreTests(unittest.TestCase):
     def test_small_video_changed_after_preview_is_not_cleaned(self):
         video = self.file('ad.mp4')
         plan = make_plan(dict(self.options, kind='jav', cleanup=True), self.config)
+        modified = video.stat().st_mtime_ns + 2_000_000_000
         video.write_bytes(b'changed')
+        os.utime(video, ns=(modified, modified))
         result = execute(plan, self.config, lambda p: 'unused')
         self.assertTrue(video.exists())
         self.assertEqual(result['trashed'], 0)
@@ -310,6 +312,18 @@ class ServerTests(unittest.TestCase):
         with patch('bridge.server.resolve',return_value='https://cdn.example/fresh?expiry=123'):
             status,headers,body=self.request(url)
         self.assertEqual(status,302);self.assertEqual(headers['Location'],'https://cdn.example/fresh?expiry=123');self.assertEqual(body,b'')
+    def test_cloud_redirect_binds_link_to_the_actual_player_user_agent(self):
+        from urllib.parse import quote, urlsplit
+        reference = {'account': 'a' * 32, 'object': {'id': 'video', 'name': 'movie.mp4'}}
+        url = urlsplit(self.state.playback(reference)).path
+        for sent, expected in [({}, ''), ({'User-Agent': ''}, ''), ({'User-Agent': 'ExamplePlayer/1.0'}, 'ExamplePlayer/1.0')]:
+            with self.subTest(headers=sent), patch.object(self.state.clouds, 'client') as client:
+                provider = client.return_value.__enter__.return_value
+                provider.link.side_effect = lambda obj, agent: ('https://cdn.example/movie.mp4?ua=' + quote(agent, safe=''), {})
+                status, headers, body = self.request(url, headers=sent)
+                self.assertEqual(status, 302)
+                self.assertEqual(headers['Location'], 'https://cdn.example/movie.mp4?ua=' + quote(expected, safe=''))
+                self.assertEqual(body, b'')
     def test_restore_preserves_existing_original(self):
         src=Path(self.temp.name)/'cloud';dst=Path(self.temp.name)/'library';src.mkdir();dst.mkdir()
         self.state.config.update(source_roots=[str(src)],target_roots=[str(dst)],mappings=[{'local':str(src),'cloud':'/115'}])
