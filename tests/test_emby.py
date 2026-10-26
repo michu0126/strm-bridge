@@ -19,6 +19,7 @@ class EmbyGatewayTests(unittest.TestCase):
         self.sources = [{'Id': 'source-1', 'Path': self.state.playback({
             'account': 'a' * 32, 'object': {'id': 'video', 'name': 'movie.mp4'}})}]
         self.upstream_requests = []
+        self.upstream_headers = []
         owner = self
 
         class Emby(BaseHTTPRequestHandler):
@@ -31,6 +32,7 @@ class EmbyGatewayTests(unittest.TestCase):
                 query = parse_qs(parsed.query)
                 token = self.headers.get('X-Emby-Token') or query.get('api_key', [''])[0]
                 owner.upstream_requests.append((parsed.path, self.headers.get('Range')))
+                owner.upstream_headers.append(dict(self.headers))
                 if token != owner.token:
                     return self.reply(401, b'Unauthorized')
                 if parsed.path.startswith('/Users/'):
@@ -119,11 +121,14 @@ class EmbyGatewayTests(unittest.TestCase):
         for sources, suffix in [([{'Id': 'source-1', 'Path': '/media/local.mp4'}], 'original.mp4'),
                                 (self.sources, 'original.mp4?MediaSourceId=unknown')]:
             self.sources = sources
-            status, headers, body = self.request(suffix, headers={'Range': 'bytes=0-1'})
+            status, headers, body = self.request(suffix, headers={
+                'Range': 'bytes=0-1', 'Host': 'media.example.test', 'X-Forwarded-Proto': 'https'})
             self.assertEqual(status, 206)
             self.assertEqual(headers['Content-Range'], 'bytes 0-1/100')
             self.assertEqual(headers['X-STRM-Bridge'], 'emby-relay')
             self.assertEqual(body, b'ok')
+            self.assertEqual(self.upstream_headers[-1]['Host'], 'media.example.test')
+            self.assertEqual(self.upstream_headers[-1]['X-Forwarded-Proto'], 'https')
         self.provider.link.assert_not_called()
 
     def test_tampered_capability_does_not_resolve_media(self):

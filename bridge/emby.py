@@ -54,7 +54,8 @@ def _relay(handler, opener, url, item):
     # Preserve normal Emby behavior for local media, subtitles, and transcoding.
     headers = {k: v for k, v in handler.headers.items() if k.lower() in {
         'authorization', 'x-emby-authorization', 'x-emby-token', 'user-agent',
-        'range', 'if-range', 'if-none-match', 'if-modified-since', 'accept'}}
+        'range', 'if-range', 'if-none-match', 'if-modified-since', 'accept',
+        'host', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-port', 'x-forwarded-proto'}}
     try:
         response = opener.open(Request(url, headers=headers, method=handler.command), timeout=30)
     except HTTPError as exc:
