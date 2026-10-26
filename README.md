@@ -87,6 +87,8 @@ docker compose -p strm-bridge up -d
 
 本地源码构建：`docker build -t michu0126/strm-bridge:local .`，然后在项目 Compose 中选择此标签。
 
+希望直接修改 NAS 上的源码时，可把仓库文件放进项目的 `source` 文件夹，在原项目的 `volumes` 下增加 `./source/bridge:/app/bridge:ro` 和 `./source/static:/app/static:ro`。修改 `source` 中的 Python 或页面文件后重启该项目即可，数据仍保存在原来的 `data` 文件夹。
+
 ## 接口依据与验证范围
 
 网盘适配器使用 Python 标准库，没有内嵌或启动 OpenList 程序。接口字段核对参考：[115 开放接口 SDK](https://github.com/OpenListTeam/115-sdk-go)、[百度网盘开放平台](https://pan.baidu.com/union/doc/)、[阿里云盘开放平台](https://www.alipan.com/developer)、[123 开放平台](https://www.123pan.com/developer)、[OpenList 驱动的协议使用](https://github.com/OpenListTeam/OpenList/tree/main/drivers)。115 加密传输格式适配自 MIT 许可的 [SheltonZhu/115driver](https://github.com/SheltonZhu/115driver)，声明保存在 `bridge/licenses/115driver-LICENSE.txt`，随镜像发布。
