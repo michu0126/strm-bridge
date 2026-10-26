@@ -217,8 +217,11 @@ class Clouds:
                 raise CloudError('云端目录包含重名或重复条目，请整理后重试')
             names.add(obj['name']); ids.add(obj['id'])
             obj.update(parent=parent, path=directory['path'].rstrip('/') + '/' + obj['name'])
-            self.remember(account, obj)
             rows.append(obj)
+        with self.state.lock:
+            self.state.db.executemany('INSERT OR REPLACE INTO cloud_nodes VALUES(?,?,?)',
+                                     [(account, obj['id'], json.dumps(obj, ensure_ascii=False)) for obj in rows])
+            self.state.db.commit()
         return rows
 
     def browse(self, source):

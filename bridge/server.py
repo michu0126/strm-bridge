@@ -23,7 +23,7 @@ from .appearance import Wallpapers, MAX_IMAGE
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
 from .cloud_login import CloudLogin
-from . import emby
+from . import emby, webdav
 
 STATIC = Path(__file__).parent.parent / 'static'
 
@@ -54,6 +54,7 @@ class State:
         self.config.setdefault('provider', 'cd2' if self.config.get('cd2_url') else 'none')
         self.config.setdefault('default_mode', 'redirect' if self.config['provider'] != 'none' else 'path')
         self.config.setdefault('emby_url', '')
+        self.config.setdefault('webdav_enabled', False)
         if not self.config_path.exists():
             self.save_config()
         for row in self.db.execute('SELECT id,value FROM jobs').fetchall():
@@ -62,6 +63,7 @@ class State:
                 j.update(status='interrupted', error='服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
                 self.put_job(j)
         self.clouds = Clouds(self)
+        self.dav_cache = webdav.DirectoryCache(self)
         self.cloud_login = CloudLogin()
         self.watcher = Watcher(self)
         self.wallpapers = Wallpapers(self.data)
@@ -252,6 +254,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def do_PROPFIND(self):
+        if webdav.is_path(urlsplit(self.path).path):
+            return webdav.handle(self)
+        return self.respond({'error': '目录不存在'}, 404)
+
+    def do_OPTIONS(self):
+        if webdav.is_path(urlsplit(self.path).path):
+            return webdav.handle(self)
+        return self.respond(b'', 200, 'text/plain', {'Allow': 'OPTIONS, GET, HEAD, POST'})
+
+    def dav_write(self):
+        if webdav.is_path(urlsplit(self.path).path):
+            return webdav.handle(self)
+        return self.respond({'error': '不支持此操作'}, 405)
+
+    do_PUT = do_DELETE = do_MKCOL = do_MOVE = do_COPY = do_PROPPATCH = do_LOCK = do_UNLOCK = dav_write
+
     def do_GET(self):
         try:
             self.get_route()
@@ -263,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
     def get_route(self):
         url = urlsplit(self.path)
         path, query = url.path, parse_qs(url.query)
+        if webdav.is_path(path):
+            return webdav.handle(self)
         if path == '/health':
             return self.respond({'status': 'ok', 'version': __version__})
         if path.startswith('/emby-play/'):
@@ -292,7 +313,8 @@ class Handler(BaseHTTPRequestHandler):
                 config = {k: v for k, v in self.state.config.items() if k not in secret_keys}
                 config.update(cd2_token_set=bool(self.state.config.get('cd2_token')), cd2_password_set=bool(self.state.config.get('cd2_password')))
                 config.update(openlist_token_set=bool(self.state.config.get('openlist_token')), openlist_password_set=bool(self.state.config.get('openlist_password')))
-                return self.respond(dict(config=config, video_extensions=sorted(VIDEO), subtitle_extensions=sorted(SUB), version=__version__))
+                return self.respond(dict(config=config, video_extensions=sorted(VIDEO), subtitle_extensions=sorted(SUB),
+                                         webdav_auth_required=os.environ.get('AUTH_DISABLED') != '1', version=__version__))
             if path == '/api/appearance':
                 return self.respond(self.state.wallpapers.status())
             if path == '/api/clouds':
@@ -336,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
     def do_POST(self):
+        if webdav.is_path(urlsplit(self.path).path):
+            return webdav.handle(self)
         try:
             self.post_route()
         except (ValueError, OSError, KeyError, TypeError) as e:
@@ -423,10 +447,12 @@ class Handler(BaseHTTPRequestHandler):
                 if self.state.busy:
                     raise ValueError('任务运行时不能修改设置')
                 c = dict(self.state.config)
-                for k in ('public_url', 'emby_url', 'provider', 'default_mode', 'openlist_url', 'openlist_user', 'openlist_password', 'openlist_token', 'url_template', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
+                for k in ('public_url', 'emby_url', 'webdav_enabled', 'provider', 'default_mode', 'openlist_url', 'openlist_user', 'openlist_password', 'openlist_token', 'url_template', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
                     if k in data:
                         c[k] = data[k]
                 valid_url(c['public_url'])
+                if not isinstance(c.get('webdav_enabled', False), bool):
+                    raise ValueError('WebDAV 开关无效')
                 if c.get('emby_url'):
                     valid_url(c['emby_url'])
                 if c.get('provider') not in ('none', 'openlist', 'template', 'cd2'):

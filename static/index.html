@@ -21,6 +21,7 @@
 <div class="card-heading"><h2>播放连接</h2></div>
 <div class="options-grid"><label>默认播放方式<select id="defaultMode"><option value="path">挂载路径</option><option value="redirect">302 直链</option></select></label><label>STRM 服务地址<input id="publicUrl" type="url" required placeholder="http://NAS-IP:18642"><small>媒体播放器可访问的地址。</small></label></div>
 <details class="advanced-settings"><summary>Emby 直链播放<span>可选</span></summary><label>Emby 服务地址<input id="embyUrl" type="url" placeholder="http://NAS-IP:8096"><small>配合现有反向代理，将影片请求直接跳转到网盘。</small></label><button id="embyStatus" type="button">查看播放状态</button><p id="embyStatusText" role="status"></p></details>
+<details class="advanced-settings" id="webdavSettings"><summary>PotPlayer / WebDAV<span>目录播放</span></summary><label class="webdav-toggle"><input id="webdavEnabled" type="checkbox"><span>启用 WebDAV 目录</span></label><label class="webdav-address">连接地址<div class="pathinput"><input id="webdavUrl" readonly><button id="copyWebdav" type="button">复制</button></div></label><p id="webdavLogin" class="appearance-note"></p><small>在 PotPlayer 添加 WebDAV 连接，即可浏览网盘文件夹并播放。原有 STRM 和 Emby 播放可同时使用。</small></details>
 <label>直链服务<select id="provider"><option value="none">不使用直链服务</option><option value="openlist">OpenList / AList</option><option value="template">HTTP 地址模板</option><option value="cd2">CloudDrive2</option></select></label>
 <div id="openlistFields" class="connection-fields hidden">
 <label>服务地址<input id="openlistUrl" type="url" placeholder="http://NAS-IP:5244"></label>
