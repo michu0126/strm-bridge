@@ -23,6 +23,7 @@ from .appearance import Wallpapers, MAX_IMAGE
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
 from .cloud_login import CloudLogin
+from . import emby
 
 STATIC = Path(__file__).parent.parent / 'static'
 
@@ -52,6 +53,7 @@ class State:
             'mappings': []}
         self.config.setdefault('provider', 'cd2' if self.config.get('cd2_url') else 'none')
         self.config.setdefault('default_mode', 'redirect' if self.config['provider'] != 'none' else 'path')
+        self.config.setdefault('emby_url', '')
         if not self.config_path.exists():
             self.save_config()
         for row in self.db.execute('SELECT id,value FROM jobs').fetchall():
@@ -263,6 +265,8 @@ class Handler(BaseHTTPRequestHandler):
         path, query = url.path, parse_qs(url.query)
         if path == '/health':
             return self.respond({'status': 'ok', 'version': __version__})
+        if path.startswith('/emby-play/'):
+            return emby.playback(self)
         if path.startswith('/play/'):
             parts = path.split('/')
             if len(parts) != 5 or not hmac.compare_digest(self.state.sign(parts[2]), parts[3]):
@@ -293,6 +297,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(self.state.wallpapers.status())
             if path == '/api/clouds':
                 return self.respond({'providers': CATALOG, 'accounts': self.state.clouds.list_accounts()})
+            if path == '/api/emby/status':
+                return self.respond(emby.status(self.state))
             if path == '/api/appearance/bing':
                 return self.respond(self.state.wallpapers.bing())
             if path.startswith('/api/appearance/image/'):
@@ -417,10 +423,12 @@ class Handler(BaseHTTPRequestHandler):
                 if self.state.busy:
                     raise ValueError('任务运行时不能修改设置')
                 c = dict(self.state.config)
-                for k in ('public_url', 'provider', 'default_mode', 'openlist_url', 'openlist_user', 'openlist_password', 'openlist_token', 'url_template', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
+                for k in ('public_url', 'emby_url', 'provider', 'default_mode', 'openlist_url', 'openlist_user', 'openlist_password', 'openlist_token', 'url_template', 'cd2_url', 'cd2_user', 'cd2_password', 'cd2_token', 'mappings'):
                     if k in data:
                         c[k] = data[k]
                 valid_url(c['public_url'])
+                if c.get('emby_url'):
+                    valid_url(c['emby_url'])
                 if c.get('provider') not in ('none', 'openlist', 'template', 'cd2'):
                     raise ValueError('直链连接方式无效')
                 if c.get('default_mode') not in ('path', 'redirect'):
