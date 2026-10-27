@@ -37,8 +37,13 @@ class Cookie115(Provider):
     def list(self, parent):
         offset, seen = 0, set()
         while True:
-            d = self.request('/files', query={'cid': parent, 'offset': offset, 'limit': 200,
-                'show_dir': 1, 'cur': 1, 'format': 'json', 'o': 'file_name', 'asc': 1})
+            query = {'aid': 1, 'cid': parent, 'offset': offset, 'limit': 200,
+                     'show_dir': 1, 'cur': 1, 'format': 'json', 'o': 'file_name', 'asc': 1}
+            # The retired 115Browser agent is rejected by the directory API.
+            # Keep the full-paging web API; the APS API repeats large directories.
+            d = self.request('/files', query=query, headers={'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'})
             if 'count' not in d or not isinstance(d.get('data'), list):
                 raise CloudError('115 目录响应不完整，请重新扫描')
             rows = d['data']

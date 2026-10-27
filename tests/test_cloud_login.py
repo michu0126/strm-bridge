@@ -37,6 +37,35 @@ class LoginProtocols(unittest.TestCase):
             with patch.object(client, 'raw', return_value=response):
                 with self.assertRaises(CloudError): list(client.list('0'))
 
+    def test_115_large_directory_keeps_full_paging_api_and_browser_agent(self):
+        client = Cookie115({'cookie': 'UID=u;CID=c;SEID=s'})
+        def page(url, method='GET', **kwargs):
+            self.assertEqual(url, 'https://webapi.115.com/files')
+            self.assertIn('Chrome/', kwargs['headers']['User-Agent'])
+            self.assertNotIn('115Browser/', kwargs['headers']['User-Agent'])
+            query = kwargs['query']
+            self.assertEqual(query['aid'], 1)
+            offset = query['offset']
+            return {'state': True, 'count': 1401, 'data': [
+                {'cid': str(i), 'n': 'folder-'+str(i)}
+                for i in range(offset, min(offset + 200, 1401))]}
+        with patch.object(client, 'raw', side_effect=page) as call:
+            self.assertEqual(len(list(client.list('0'))), 1401)
+        self.assertEqual(call.call_args_list[-1].kwargs['query']['offset'], 1400)
+
+    def test_115_directory_failure_is_not_an_empty_listing(self):
+        client = Cookie115({'cookie': 'x'})
+        with patch.object(client, 'raw', side_effect=CloudError('HTTP 405')) as call:
+            with self.assertRaises(CloudError): list(client.list('0'))
+        self.assertEqual(call.call_count, 1)
+
+    def test_115_repeated_directory_page_is_rejected(self):
+        client = Cookie115({'cookie': 'x'})
+        response = {'state': True, 'count': 2, 'data': [{'cid': '10', 'n': 'folder'}]}
+        with patch.object(client, 'raw', return_value=response) as call:
+            with self.assertRaises(CloudError): list(client.list('0'))
+        self.assertEqual(call.call_count, 2)
+
     def test_115_download_uses_pickcode_encryption_and_player_agent(self):
         client = Cookie115({'cookie': 'x'})
         with patch.object(client, 'raw', return_value={'state': True, 'data': 'encrypted'}) as call, patch('bridge.cipher115.decode', return_value=b'{"123":{"url":{"url":"https://cdn.example/movie"}}}'), patch('bridge.cipher115.encode', return_value='WIRE') as enc:
