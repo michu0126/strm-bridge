@@ -178,6 +178,17 @@ class UploadWatchTests(unittest.TestCase):
         self.assertTrue(p.exists())
         self.state.uploads.control(watch['id'], retry=True); self.run_watch()
         self.assertFalse(p.exists()); self.assertEqual(len(self.fake.calls), 1)
+    def test_delete_local_rechecks_existing_cloud_file_before_unlink(self):
+        p = self.write('remote-removed.mp4', b'same'); self.save(include_existing=True, delete_local=True)
+        matching = item('same', p.name, size=4, sha1=hashlib.sha1(b'same').hexdigest())
+        calls = []
+        def listing(parent):
+            calls.append(parent)
+            return iter([matching] if len(calls) == 1 else [])
+        self.fake.list = listing
+        self.run_watch()
+        self.assertTrue(p.exists()); self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.state.uploads.list()[0]['last_status'], 'partial')
 
 
 if __name__ == '__main__': unittest.main()

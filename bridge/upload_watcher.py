@@ -289,6 +289,10 @@ class UploadWatcher:
                         if watch.get('delete_local') and current_record['status'] in ('uploaded', 'skipped'):
                             if cancel():
                                 raise UploadCancelled('上传已暂停')
+                            rows = [r for r in children(parent, True) if r['name'] == current_path.name]
+                            if (len(rows) != 1 or rows[0]['folder'] or rows[0]['size'] != current_record['signature'][0]
+                                    or rows[0].get('sha1', '').upper() != sha1):
+                                raise CloudError('网盘文件发生变化，保留本地文件并等待重新核对')
                             if file_signature(current_path) != current_record['signature']:
                                 raise CloudError('本地文件已变化，保留文件并等待重新检查')
                             current_path.unlink()
