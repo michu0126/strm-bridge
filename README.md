@@ -65,7 +65,16 @@
 
 ### PotPlayer 浏览网盘文件夹
 
-在“连接设置 → PotPlayer / WebDAV”勾选“启用 WebDAV 目录”并保存。PotPlayer 的“打开 FTP/WebDAV/HTTP”中选择 WebDAV，填写工具页面显示的连接地址，例如 `http://NAS-IP:18642/dav/`。若分别填写服务器与路径，服务器填 NAS 地址、端口填 `18642`、路径填 `/dav/`。
+在“连接设置 → PotPlayer / WebDAV”勾选“启用 WebDAV 目录”并保存。PotPlayer 的“打开 FTP/WebDAV/HTTP”中，按页面显示的各项分别填写。例如工具部署在 `http://NAS-IP:18642` 时：
+
+| PotPlayer 字段 | 填写内容 |
+| --- | --- |
+| 协议 | WebDAV |
+| 主机(IP)/路径 | `NAS-IP/dav/` |
+| 端口 | `18642` |
+| SSL | 不勾选；服务使用 HTTPS 时才勾选 |
+
+主机栏不包含 `http://`、`https://` 或端口。若有单独的“文件夹”字段，主机填 NAS 地址，文件夹填 `/dav/`。完整 WebDAV URL（供其他支持 URL 的客户端使用）仍为 `http://NAS-IP:18642/dav/`。
 
 开启管理密码时，用户名为 `admin`，密码与工作台管理密码相同；`AUTH_DISABLED=1` 时用户名和密码留空。WebDAV 沿用现有登录设置，不创建新的令牌或网盘账号。
 

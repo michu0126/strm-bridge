@@ -54,7 +54,10 @@ $('embyStatus').addEventListener('click',safe(async()=>{const s=await api('/api/
 
 let webdavAuthRequired=true;
 function webdavInfo(){
-  $('webdavUrl').value=window.location.origin+'/dav/';
+  const connection=window.location;
+  $('webdavUrl').value=connection.hostname+'/dav/';
+  $('webdavPort').value=connection.port||(connection.protocol==='https:'?'443':'80');
+  $('webdavProtocol').textContent='协议：WebDAV · SSL：'+(connection.protocol==='https:'?'勾选':'不勾选');
   $('webdavLogin').textContent=!$('webdavEnabled').checked?'勾选后保存设置，即可连接。':webdavAuthRequired?'用户名：admin；密码：工作台管理密码。':'当前已关闭管理密码，用户名和密码留空。';
 }
 document.addEventListener('bridge-ready',e=>{webdavAuthRequired=e.detail.webdav_auth_required;$('webdavEnabled').checked=!!e.detail.config.webdav_enabled;webdavInfo();});
@@ -62,6 +65,6 @@ $('webdavEnabled').addEventListener('change',webdavInfo);
 $('copyWebdav').addEventListener('click',safe(async()=>{
   const field=$('webdavUrl');
   try{if(!navigator.clipboard)throw Error();await navigator.clipboard.writeText(field.value);}
-  catch{field.focus();field.select();if(!document.execCommand('copy'))return toast('请复制连接地址');}
-  toast('WebDAV 地址已复制');
+    catch{field.focus();field.select();if(!document.execCommand('copy'))return toast('请复制主机/路径');}
+  toast('主机/路径已复制，端口请单独填写');
 }));
