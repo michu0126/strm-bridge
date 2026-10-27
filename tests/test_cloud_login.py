@@ -45,6 +45,7 @@ class LoginProtocols(unittest.TestCase):
             self.assertNotIn('115Browser/', kwargs['headers']['User-Agent'])
             query = kwargs['query']
             self.assertEqual(query['aid'], 1)
+            self.assertEqual(query['fc_mix'], 1)
             offset = query['offset']
             return {'state': True, 'count': 1401, 'data': [
                 {'cid': str(i), 'n': 'folder-'+str(i)}
@@ -52,6 +53,21 @@ class LoginProtocols(unittest.TestCase):
         with patch.object(client, 'raw', side_effect=page) as call:
             self.assertEqual(len(list(client.list('0'))), 1401)
         self.assertEqual(call.call_args_list[-1].kwargs['query']['offset'], 1400)
+
+    def test_115_upload_during_paging_does_not_shift_previously_read_items(self):
+        client = Cookie115({'cookie': 'x'})
+        objects = [{'cid': str(i), 'n': 'ZZZ-'+str(i).zfill(4), 't': i} for i in range(400)]
+        def page(url, method='GET', **kwargs):
+            query = kwargs['query']
+            rows = sorted(objects, key=lambda r: r['t'] if query['o'] == 'user_ptime' else r['n'])
+            offset = query['offset']
+            response = {'state': True, 'count': len(rows), 'data': rows[offset:offset+200]}
+            if offset == 0:
+                objects.append({'cid': '400', 'n': 'AAA-new-upload', 't': 400})
+            return response
+        with patch.object(client, 'raw', side_effect=page):
+            rows = list(client.list('0'))
+        self.assertEqual({r['id'] for r in rows}, {str(i) for i in range(401)})
 
     def test_115_directory_failure_is_not_an_empty_listing(self):
         client = Cookie115({'cookie': 'x'})
