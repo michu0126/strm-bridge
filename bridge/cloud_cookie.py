@@ -39,7 +39,7 @@ class Cookie115(Provider):
         offset, seen = 0, set()
         while True:
             # New uploads append to this order instead of shifting earlier pages.
-            query = {'aid': 1, 'cid': parent, 'offset': offset, 'limit': 200,
+            query = {'aid': 1, 'cid': parent, 'offset': offset, 'limit': 1000,
                      'show_dir': 1, 'cur': 1, 'format': 'json', 'o': 'user_ptime',
                      'asc': 1, 'fc_mix': 1, 'custom_order': 1}
             # The retired 115Browser agent is rejected by the directory API.

@@ -7,6 +7,7 @@ import uuid
 
 from .core import inside, make_plan, execute, media_extensions
 from .cloud import is_cloud, parse_uri
+from .progress import ExecutionProgress
 
 
 class Watcher:
@@ -98,10 +99,11 @@ class Watcher:
         state = self.state
         job = {'id': job_id, 'watch_id': watch['id'], 'status': 'scanning', 'created': time.time(),
                'options': watch['options'], 'done': 0, 'total': 0}
-        recorded = False
+        recorded = True
+        state.put_job(job)
         cancel = lambda: self.stop.is_set() or job_id in state.cancelled
         try:
-            plan = state.make_plan(watch['options'], config, cancel)
+            plan = state.make_plan(watch['options'], config, cancel, state.scan_progress(job))
             # Additions only: never move, clean up, rewrite or delete an existing file.
             # A recently modified source is retried on the next pass.
             plan['actions'] = [a for a in plan['actions'] if a['type'] in ('strm', 'copy')
@@ -112,18 +114,18 @@ class Watcher:
                 job.update(status='running', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
                 state.put_job(job)
                 recorded = True
-                def progress(done, total, current):
-                    job.update(done=done, total=total, current=current)
-                    state.put_job(job)
+                progress = ExecutionProgress(state, job)
                 result = state.execute(plan, config, state.playback, progress, cancel)
                 job.update(status='cancelled' if result['cancelled'] else ('partial' if result['errors'] else 'completed'), result=result)
                 watch.update(last_status=job['status'], last_job=job_id, last_result=result,
                              last_error='；'.join(e['message'] for e in result['errors'][:3]))
             else:
                 watch.update(last_status='idle', last_error='', last_result={'created': 0, 'subtitles': 0})
+                job.update(status='completed', counts=plan['counts'], result={
+                    'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'errors': [], 'cancelled': False})
         except Exception as e:
-            job.update(status='failed', error=str(e))
-            watch.update(last_status='failed', last_error=str(e), last_job=job_id)
+            job.update(status='cancelled' if cancel() else 'failed', error=str(e))
+            watch.update(last_status=job['status'], last_error=str(e), last_job=job_id)
             recorded = True
         finally:
             with state.lock:

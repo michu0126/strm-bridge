@@ -17,6 +17,7 @@ import uuid
 
 from . import __version__
 from .core import VIDEO, SUB, SKIP_DIRS, inside, make_plan, execute
+from .progress import ExecutionProgress
 from .resolver import valid_url, resolve, test_connection
 from .watcher import Watcher
 from .upload_watcher import UploadWatcher
@@ -39,6 +40,8 @@ class State:
         self.db = sqlite3.connect(str(self.data / 'bridge.db'), check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, value TEXT); CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY, path TEXT); CREATE TABLE IF NOT EXISTS journal(job TEXT, kind TEXT, value TEXT);')
+        self.db.execute('CREATE TABLE IF NOT EXISTS job_plans(id TEXT PRIMARY KEY,value TEXT)')
+        self.saved_plans = {row[0] for row in self.db.execute('SELECT id FROM job_plans')}
         self.key = self.secret('playback-key.txt')
         self.password = os.environ.get('ADMIN_PASSWORD') or self.secret('admin-password.txt')
         self.config_path = self.data / 'config.json'
@@ -62,7 +65,7 @@ class State:
             self.config.setdefault('upload_roots', [])
         if not self.config_path.exists():
             self.save_config()
-        for row in self.db.execute('SELECT id,value FROM jobs').fetchall():
+        for row in self.db.execute("SELECT id,value FROM jobs WHERE json_extract(value,'$.status') IN ('running','scanning','queued')").fetchall():
             j = json.loads(row[1])
             if j['status'] in ('running', 'scanning', 'queued'):
                 message = ('服务重启，上传监控将在启用后自动继续。' if j.get('type') == 'upload' else
@@ -91,20 +94,44 @@ class State:
 
     def put_job(self, job):
         with self.lock:
-            self.db.execute('INSERT OR REPLACE INTO jobs VALUES(?,?)', (job['id'], json.dumps(job, ensure_ascii=False)))
+            plan = job.get('plan')
+            if plan is not None and job['id'] not in self.saved_plans:
+                self.db.execute('INSERT OR REPLACE INTO job_plans VALUES(?,?)', (job['id'], json.dumps(plan, ensure_ascii=False)))
+                self.saved_plans.add(job['id'])
+            value = {k: v for k, v in job.items() if k != 'plan'}
+            if plan is not None:
+                value['action_total'] = len(plan['actions'])
+            self.db.execute('INSERT OR REPLACE INTO jobs VALUES(?,?)', (job['id'], json.dumps(value, ensure_ascii=False)))
             self.db.commit()
 
-    def job(self, job_id):
+    def job(self, job_id, include_plan=True):
         with self.lock:
-            row = self.db.execute('SELECT value FROM jobs WHERE id=?', (job_id,)).fetchone()
+            row = self.db.execute("SELECT json_remove(value,'$.plan') FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             raise ValueError('任务不存在')
-        return json.loads(row[0])
+        job = json.loads(row[0])
+        if include_plan:
+            with self.lock:
+                stored = self.db.execute("SELECT value FROM job_plans WHERE id=? UNION ALL SELECT json_extract(value,'$.plan') FROM jobs WHERE id=? LIMIT 1", (job_id, job_id)).fetchone()
+            if stored and stored[0]:
+                job['plan'] = json.loads(stored[0])
+        return job
+
+    def job_preview(self, job_id, offset=0):
+        job = self.job(job_id, include_plan=False)
+        # SQLite streams the requested slice; polling never decodes the entire plan.
+        with self.lock:
+            source = "WITH p AS (SELECT value FROM job_plans WHERE id=? UNION ALL SELECT json_extract(value,'$.plan') FROM jobs WHERE id=? LIMIT 1) "
+            rows = self.db.execute(source + "SELECT a.value FROM p,json_each(p.value,'$.actions') a LIMIT 500 OFFSET ?", (job_id, job_id, max(0, offset))).fetchall()
+            count = self.db.execute(source + "SELECT json_array_length(value,'$.actions') FROM p", (job_id, job_id)).fetchone()
+        if count and count[0] is not None:
+            job.update(actions=[json.loads(row[0]) for row in rows], action_total=count[0])
+        return job
 
     def jobs(self):
         with self.lock:
-            rows = self.db.execute('SELECT value FROM jobs ORDER BY rowid DESC LIMIT 50').fetchall()
-        return [{k: v for k, v in json.loads(row[0]).items() if k != 'plan'} for row in rows]
+            rows = self.db.execute("SELECT json_remove(value,'$.plan') FROM jobs ORDER BY rowid DESC LIMIT 50").fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def journal(self, job, kind, value):
         with self.lock:
@@ -124,8 +151,14 @@ class State:
             self.db.commit()
         return self.config['public_url'].rstrip('/') + '/play/' + media_id + '/' + self.sign(media_id) + '/' + quote(p['object']['name'] if remote else p.name, safe='')
 
-    def make_plan(self, options, config, cancel=lambda: False):
-        return self.clouds.plan(options, config, cancel) if is_cloud(options['source']) else make_plan(options, config, cancel)
+    def make_plan(self, options, config, cancel=lambda: False, progress=lambda info: None):
+        return self.clouds.plan(options, config, cancel, progress) if is_cloud(options['source']) else make_plan(options, config, cancel, progress)
+
+    def scan_progress(self, job):
+        def update(info):
+            job['scan'] = info
+            self.put_job(job)
+        return update
 
     def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
         runner = self.clouds.execute if 'account' in plan else execute
@@ -142,7 +175,7 @@ class State:
         self.put_job(job)
         def work():
             try:
-                plan = self.make_plan(options, config, lambda: job_id in self.cancelled)
+                plan = self.make_plan(options, config, lambda: job_id in self.cancelled, self.scan_progress(job))
                 job.update(status='preview', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
             except Exception as e:
                 job.update(status='cancelled' if job_id in self.cancelled else 'failed', error=str(e))
@@ -164,9 +197,7 @@ class State:
             job['status'] = 'running'
             self.put_job(job)
             config = dict(self.config)
-        def progress(done, total, current):
-            job.update(done=done, total=total, current=current)
-            self.put_job(job)
+        progress = ExecutionProgress(self, job)
         def work():
             try:
                 result = self.execute(job['plan'], config, self.playback, progress,
@@ -367,11 +398,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/uploads':
                 return self.respond(self.state.uploads.list())
             if path.startswith('/api/jobs/'):
-                job = self.state.job(path.rsplit('/', 1)[-1])
-                if 'plan' in job:
-                    plan = job.pop('plan')
-                    offset = max(0, int(query.get('offset', ['0'])[0]))
-                    job.update(actions=plan['actions'][offset:offset + 500], action_total=len(plan['actions']))
+                offset = max(0, int(query.get('offset', ['0'])[0]))
+                job_id = path.rsplit('/', 1)[-1]
+                job = self.state.job(job_id, include_plan=False) if query.get('summary') == ['1'] else self.state.job_preview(job_id, offset)
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')

@@ -21,3 +21,7 @@ dialog{background:rgb(var(--surface-rgb)/.97);color:var(--text);border:1px solid
 #cloudMethodLabel[hidden]{display:none}
 
 .webdav-toggle{display:flex;align-items:center;gap:10px;margin:18px 0}.settings-card .webdav-toggle>input{margin:0}.webdav-address{margin:18px 0;max-width:100%!important}.webdav-address .pathinput{margin-top:9px}.webdav-address input{margin:0!important}
+
+.progress-track i.scan-active{width:30%!important;animation:scan-progress 1.6s ease-in-out infinite}
+@keyframes scan-progress{0%{transform:translateX(-100%)}100%{transform:translateX(340%)}}
+@media(prefers-reduced-motion:reduce){.progress-track i.scan-active{animation:none;transform:none}}

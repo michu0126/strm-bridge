@@ -163,9 +163,52 @@ class NativeCloudTests(unittest.TestCase):
     def test_refresh_token_replacement_drops_stale_access(self):
         self.state.clouds.save({'id': self.account['id'], 'credentials': {'refresh_token': 'new'}})
         self.assertNotIn('access_token', self.state.clouds.accounts[self.account['id']]['credentials'])
-    def test_duplicate_names_abort_instead_of_overwriting(self):
+    def test_duplicate_names_keep_both_with_stable_distinct_targets(self):
         self.fake.add('same.mkv'); self.fake.add('same.mkv')
-        with self.assertRaises(CloudError): self.plan()
+        plan = self.plan()
+        targets = [a['target'] for a in plan['actions']]
+        self.assertEqual(len(set(targets)), 2)
+        self.fake.tree['dir'].reverse()
+        self.assertEqual(set(targets), {a['target'] for a in self.plan()['actions']})
+        result = self.run_plan(plan)
+        self.assertEqual(result['created'], 2)
+        self.assertEqual(result['errors'], [])
+
+    def test_duplicate_directory_names_do_not_merge_their_contents(self):
+        self.fake.tree['dir'] = [item('a', 'same', True), item('b', 'same', True)]
+        self.fake.tree['a'] = []; self.fake.tree['b'] = []
+        self.fake.add('movie.mkv', parent='a'); self.fake.add('movie.mkv', parent='b')
+        plan = self.plan()
+        self.assertEqual(len({Path(a['target']).parent for a in plan['actions']}), 2)
+
+    def test_interrupted_scan_resumes_but_completed_scan_is_fresh(self):
+        self.fake.tree['dir'] = [item('a', 'A', True), item('b', 'B', True)]
+        self.fake.tree['a'] = []; self.fake.tree['b'] = []
+        self.fake.add('movie.mkv', parent='b')
+        original = self.fake.list
+        def broken(parent):
+            if parent == 'a': raise CloudError('network interrupted')
+            return original(parent)
+        with patch.object(self.fake, 'list', side_effect=broken):
+            with self.assertRaises(CloudError): self.plan()
+        with patch.object(self.fake, 'list', wraps=original) as calls:
+            plan = self.plan()
+            self.assertEqual([c.args[0] for c in calls.call_args_list], ['a'])
+        self.assertEqual(plan['counts']['strm'], 1)
+        self.fake.add('new.mkv', parent='b')
+        self.assertEqual(self.plan()['counts']['strm'], 2)
+
+    def test_scan_releases_account_lock_between_directories(self):
+        import threading
+        acquired = []
+        def progress(info):
+            def other_request():
+                with self.state.clouds.client(self.account['id']): acquired.append(True)
+            t = threading.Thread(target=other_request)
+            t.start(); t.join(timeout=1)
+            self.assertFalse(t.is_alive(), 'scan held the playback account lock during progress')
+        self.state.make_plan(self.options, self.state.config, progress=progress)
+        self.assertTrue(acquired)
 
 
 class ProviderProtocolTests(unittest.TestCase):

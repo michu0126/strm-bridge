@@ -1,5 +1,6 @@
 """Account storage, cloud directory plans and recoverable remote moves."""
 from contextlib import contextmanager
+from collections import Counter, OrderedDict
 import copy
 import hashlib
 import json
@@ -15,6 +16,7 @@ import uuid
 from .cloud_providers import PROVIDERS, CATALOG, SECRET_FIELDS, CloudError, item, create_provider
 from .core import inside, media_extensions, SUB, SKIP_DIRS, CLEANUP_LIMIT, subtitle_match, subtitle_tail, exclusive_write, config_fingerprint
 from .resolver import valid_url
+from .progress import ScanProgress
 
 
 def is_cloud(source):
@@ -44,6 +46,28 @@ def signature(obj):
     return [obj['id'], obj['size'], obj['modified']]
 
 
+def scan_names(rows):
+    """Keep every same-named cloud item with stable, distinct local paths."""
+    counts = Counter(obj['name'] for obj in rows)
+    used = set(counts)
+    names = {}
+    for obj in sorted(rows, key=lambda obj: obj['id']):
+        name = obj['name']
+        if counts[name] > 1:
+            suffix = '' if obj['folder'] else PurePosixPath(name).suffix
+            stem = name[:-len(suffix)] if suffix else name
+            tag = hashlib.sha256(obj['id'].encode()).hexdigest()[:12]
+            candidate = stem + '.' + tag + suffix
+            number = 1
+            while candidate in used:
+                candidate = stem + '.' + tag + '.' + str(number) + suffix
+                number += 1
+            used.add(candidate)
+            name = candidate
+        names[obj['id']] = name
+    return names
+
+
 class DownloadRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         valid_url(newurl)
@@ -64,6 +88,7 @@ class Clouds:
         self.accounts = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {}
         with state.lock:
             state.db.execute('CREATE TABLE IF NOT EXISTS cloud_nodes(account TEXT,id TEXT,value TEXT,PRIMARY KEY(account,id))')
+            state.db.execute('CREATE TABLE IF NOT EXISTS scan_directories(scan TEXT,parent TEXT,checked REAL,value TEXT,PRIMARY KEY(scan,parent))')
             state.db.commit()
 
     def persist(self):
@@ -206,7 +231,7 @@ class Clouds:
             raise CloudError('请从网盘根目录逐级选择文件夹')
         return json.loads(row[0])
 
-    def entries(self, account, parent, client, cancel=lambda: False):
+    def entries(self, account, parent, client, cancel=lambda: False, progress=lambda n: None, allow_duplicates=False):
         directory = self.node(account, parent)
         if not directory['folder']:
             raise CloudError('所选位置不是文件夹')
@@ -215,22 +240,45 @@ class Clouds:
             if cancel():
                 raise CloudError('任务已取消')
             safe_name(obj['name'])
-            if obj['id'] in ids or obj['name'] in names:
-                raise CloudError('云端目录包含重名或重复条目，请整理后重试')
-            names.add(obj['name']); ids.add(obj['id'])
+            if obj['id'] in ids:
+                raise CloudError('云端目录分页返回了重复 ID，请重新扫描')
+            if obj['name'] in names and not allow_duplicates:
+                raise CloudError('云端目录包含重名条目')
+            names.add(obj['name'])
+            ids.add(obj['id'])
             obj.update(parent=parent, path=directory['path'].rstrip('/') + '/' + obj['name'])
             rows.append(obj)
+            if len(rows) % 200 == 0:
+                progress(len(rows))
         with self.state.lock:
             self.state.db.executemany('INSERT OR REPLACE INTO cloud_nodes VALUES(?,?,?)',
                                      [(account, obj['id'], json.dumps(obj, ensure_ascii=False)) for obj in rows])
             self.state.db.commit()
         return rows
 
+    def scan_entries(self, key, account, parent, cancel, progress):
+        # Only unfinished scans are resumed. A completed scan removes its checkpoints,
+        # so the next manual scan or monitor pass always checks the live drive again.
+        with self.state.lock:
+            row = self.state.db.execute('SELECT value FROM scan_directories WHERE scan=? AND parent=? AND checked>?',
+                                        (key, parent, time.time() - 86400)).fetchone()
+        if row:
+            return json.loads(row[0]), True
+        if cancel():
+            raise CloudError('任务已取消')
+        with self.client(account) as client:
+            rows = self.entries(account, parent, client, cancel, progress, allow_duplicates=True)
+        with self.state.lock:
+            self.state.db.execute('INSERT OR REPLACE INTO scan_directories VALUES(?,?,?,?)',
+                                  (key, parent, time.time(), json.dumps(rows, ensure_ascii=False)))
+            self.state.db.commit()
+        return rows, False
+
     def browse(self, source):
         account, identifier = parse_uri(source)
         with self.client(account) as client:
             directory = self.node(account, identifier)
-            rows = self.entries(account, identifier, client)
+            rows = self.entries(account, identifier, client, allow_duplicates=True)
         return {'path': source, 'label': self.account(account)['name'] + directory['path'],
                 'parent': uri(account, directory['parent']) if directory['parent'] is not None else '',
                 'directories': [{'name': x['name'], 'path': uri(account, x['id'])} for x in sorted(rows, key=lambda x: x['name'].casefold()) if x['folder'] and x['name'] not in SKIP_DIRS],
@@ -250,7 +298,7 @@ class Clouds:
                 self.persist()
             raise
 
-    def plan(self, options, config, cancel=lambda: False):
+    def plan(self, options, config, cancel=lambda: False, progress=lambda info: None):
         account, root = parse_uri(options['source'])
         dst = inside(options['target'], config['target_roots'])
         if not dst.is_dir():
@@ -262,28 +310,45 @@ class Clouds:
         valid_url(config['public_url'])
         ext = media_extensions(options.get('extra_extensions', ''))
         files, visited, todo = {}, set(), [(root, PurePosixPath('.'))]
-        with self.client(account) as client:
-            revision = self.account(account)['revision']
-            while todo:
-                if cancel():
-                    raise CloudError('任务已取消')
-                parent, relative = todo.pop()
-                if parent in visited:
-                    raise CloudError('云端目录出现循环，请重新扫描')
-                visited.add(parent)
-                for obj in self.entries(account, parent, client, cancel):
-                    p = relative / obj['name']
-                    if obj['folder']:
-                        if obj['name'] not in SKIP_DIRS:
-                            todo.append((obj['id'], p))
-                    else:
+        revision = self.account(account)['revision']
+        key = hashlib.sha256((account + ':' + str(revision) + ':' + root).encode()).hexdigest()
+        report = ScanProgress(progress)
+        report.update(force=True)
+        cached = 0
+        seen_files = 0
+        while todo:
+            if cancel():
+                raise CloudError('任务已取消')
+            parent, relative = todo.pop()
+            if parent in visited:
+                raise CloudError('云端目录出现循环，请重新扫描')
+            report.update(current=str(relative), pending=len(todo) + 1)
+            rows, reused = self.scan_entries(key, account, parent, cancel,
+                lambda n: report.update(current=str(relative), entries_in_directory=n))
+            cached += int(reused)
+            visited.add(parent)
+            names = scan_names(rows)
+            for obj in rows:
+                p = relative / names[obj['id']]
+                if obj['folder']:
+                    if obj['name'] not in SKIP_DIRS:
+                        todo.append((obj['id'], p))
+                else:
+                    seen_files += 1
+                    suffix = p.suffix.lower().lstrip('.')
+                    if options.get('cleanup') or suffix in ext or (options['kind'] != 'jav' and suffix in SUB):
                         files[p] = obj
+            report.update(directories=len(visited), files=seen_files, pending=len(todo), cached_directories=cached)
+        if self.account(account)['revision'] != revision:
+            raise CloudError('网盘账号已变更，请重新扫描')
         videos = [p for p in files if p.suffix.lower().lstrip('.') in ext]
+        report.update(force=True, phase='planning', videos=len(videos), current='整理生成清单')
         trash = []
         if options.get('cleanup'):
             parents = {p.parent for p in videos}
             trash = [p for p, obj in files.items() if p.parent in parents and obj['size'] < CLEANUP_LIMIT]
-            videos = [p for p in videos if p not in set(trash)]
+            trash_set = set(trash)
+            videos = [p for p in videos if p not in trash_set]
         actions, warnings, used, targets = [], [], set(), {}
 
         def action(kind, p, target=None):
@@ -294,6 +359,9 @@ class Clouds:
             return a
 
         for p in videos:
+            if cancel():
+                raise CloudError('任务已取消')
+            report.update(current=str(p))
             out = inside(dst / str(p.with_suffix('.strm')), [dst])
             if out in used:
                 out = out.with_name(p.name + '.strm')
@@ -302,10 +370,16 @@ class Clouds:
             used.add(out); targets[p] = out
             actions.append(action('strm', p, out))
         if options['kind'] != 'jav':
+            by_parent = {}
+            for video in videos:
+                by_parent.setdefault(video.parent, []).append(video)
             for p in files:
+                if cancel():
+                    raise CloudError('任务已取消')
                 if p.suffix.lower().lstrip('.') not in SUB:
                     continue
-                video = subtitle_match(p, videos)
+                parent = p.parent.parent if p.parent.name.lower() in ('subs', 'subtitles', '字幕') else p.parent
+                video = subtitle_match(p, list(dict.fromkeys(by_parent.get(p.parent, []) + by_parent.get(parent, []))))
                 if video is None:
                     warnings.append('字幕匹配不唯一，已跳过：' + str(p))
                     continue
@@ -318,6 +392,10 @@ class Clouds:
                 used.add(out)
                 actions.append(action(options.get('subtitle_mode', 'copy'), p, out))
         actions.extend(action('trash', p) for p in trash)
+        with self.state.lock:
+            self.state.db.execute('DELETE FROM scan_directories WHERE scan=? OR checked<?', (key, time.time() - 86400))
+            self.state.db.commit()
+        report.update(force=True, phase='ready', current='', pending=0)
         return {'id': uuid.uuid4().hex, 'created': time.time(), 'account': account, 'account_revision': revision,
                 'options': dict(options, target=str(dst), mode='redirect'), 'actions': actions, 'warnings': warnings,
                 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
@@ -381,14 +459,16 @@ class Clouds:
         _, root = parse_uri(plan['options']['source'])
         dst = inside(plan['options']['target'], config['target_roots'])
         result = {'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'errors': [], 'cancelled': False}
-        checked = {}
-        with self.client(account) as client:
-            for i, action in enumerate(plan['actions']):
-                if cancel():
-                    result['cancelled'] = True
-                    break
-                obj = action['remote']
-                try:
+        checked = OrderedDict()
+        for i, action in enumerate(plan['actions']):
+            if cancel():
+                result['cancelled'] = True
+                break
+            obj = action['remote']
+            try:
+                with self.client(account) as client:
+                    if self.account(account)['revision'] != plan['account_revision']:
+                        raise CloudError('网盘账号已变更，请重新扫描')
                     kind = action['type']
                     if kind == 'trash':
                         if result['errors']:
@@ -399,7 +479,9 @@ class Clouds:
                         result['trashed'] += 1
                     else:
                         if obj['parent'] not in checked:
-                            checked[obj['parent']] = {r['id']: r for r in self.entries(account, obj['parent'], client, cancel)}
+                            if len(checked) >= 32:
+                                checked.popitem(last=False)
+                            checked[obj['parent']] = {r['id']: r for r in self.entries(account, obj['parent'], client, cancel, allow_duplicates=True)}
                         current = checked[obj['parent']].get(obj['id'])
                         if current is None or signature(current) != action['signature']:
                             raise CloudError('云端文件已变更，请重新扫描')
@@ -427,9 +509,9 @@ class Clouds:
                                     self.quarantine(account, client, obj, root, plan['id'], journal)
                         else:
                             raise CloudError('未知操作')
-                except Exception as e:
-                    result['errors'].append({'path': action['source'], 'message': str(e)})
-                progress(i + 1, len(plan['actions']), action['source'])
+            except Exception as e:
+                result['errors'].append({'path': action['source'], 'message': str(e)})
+            progress(i + 1, len(plan['actions']), action['source'])
         return result
 
     def restore(self, job_id):

@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 import uuid
+from .progress import ScanProgress
 
 VIDEO = set(('3g2 3gp 3gp2 3gpp amv asf avi avs bdav bik bink dat divx dpg dv evo f4v flc fli flv h264 h265 hdmov hevc img iso ivf m1v m2p m2t m2ts m2v m4v m4p mk3d mkv mov mp2v mp4 mpe mpeg mpg mpv mts mxf nsv nut ogm ogv ogx qt ram rec rm rmvb rpl smk svi tod tp trp ts vdr vob vro webm wm wmv wtv xvid y4m').split())
 SUB = set('srt ass ssa sub idx vtt sup smi sami txt ttml dfxp sbv scc stl lrc usf aqt jss mpl pjs rt sst tts'.split())
@@ -39,15 +40,18 @@ def media_extensions(extra=''):
         raise ValueError('不能把字幕、STRM 或元数据作为视频扩展名')
     return extensions
 
-def walk(root, cancel=lambda: False):
+def walk(root, cancel=lambda: False, visit=lambda folder: None):
     errors = []
     def onerror(e):
         errors.append(str(e))
     for folder, dirs, files in os.walk(root, followlinks=False, onerror=onerror):
         if cancel():
             raise ValueError('任务已取消')
+        visit(folder)
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not Path(folder, d).is_symlink())
         for name in sorted(files):
+            if cancel():
+                raise ValueError('任务已取消')
             p = Path(folder, name)
             if not p.is_symlink() and p.is_file():
                 yield p
@@ -80,7 +84,7 @@ def subtitle_tail(sub, video):
         tail = '.'.join(tags)
     return ('.' + tail if tail else '') + sub.suffix.lower()
 
-def make_plan(options, config, cancel=lambda: False):
+def make_plan(options, config, cancel=lambda: False, progress=lambda info: None):
     src = inside(options['source'], config['source_roots'])
     dst = inside(options['target'], config['target_roots'])
     if not src.is_dir() or not dst.is_dir():
@@ -104,9 +108,18 @@ def make_plan(options, config, cancel=lambda: False):
         cloud_path(src, config)
         if config.get('provider') == 'none':
             raise ValueError('尚未配置可选直链服务，请选择「挂载路径」即可独立生成')
-    files = list(walk(src, cancel))
+    report = ScanProgress(progress)
+    report.update(force=True)
+    files, directories = [], set()
+    def visiting(folder):
+        directories.add(Path(folder))
+        report.update(files=len(files), directories=len(directories), current=str(Path(folder).relative_to(src)))
+    for p in walk(src, cancel, visiting):
+        files.append(p)
+        report.update(files=len(files), directories=len(directories), current=str(p.relative_to(src)))
     ext = media_extensions(options.get('extra_extensions', ''))
     videos = [p for p in files if p.suffix.lower().lstrip('.') in ext]
+    report.update(force=True, phase='planning', videos=len(videos), current='整理生成清单')
     cleanup_files = []
     if cleanup:
         # Determine the media folders before filtering small video advertisements.
@@ -117,6 +130,9 @@ def make_plan(options, config, cancel=lambda: False):
     actions, warnings, used = [], [], set()
     targets = {}
     for v in videos:
+        if cancel():
+            raise ValueError('任务已取消')
+        report.update(current=str(v.relative_to(src)))
         out = dst / v.relative_to(src).with_suffix('.strm')
         if out in used:
             out = out.with_name(v.name + '.strm')
@@ -126,10 +142,16 @@ def make_plan(options, config, cancel=lambda: False):
         targets[v] = out
         actions.append({'type': 'strm', 'source': str(v), 'target': str(out), 'signature': signature(v)})
     if kind in ('movie', 'tv'):
+        by_parent = {}
+        for video in videos:
+            by_parent.setdefault(video.parent, []).append(video)
         for p in files:
+            if cancel():
+                raise ValueError('任务已取消')
             if p.suffix.lower().lstrip('.') not in SUB:
                 continue
-            video = subtitle_match(p, videos)
+            parent = p.parent.parent if p.parent.name.lower() in ('subs', 'subtitles', '字幕') else p.parent
+            video = subtitle_match(p, list(dict.fromkeys(by_parent.get(p.parent, []) + by_parent.get(parent, []))))
             if video is None:
                 warnings.append('字幕匹配不唯一，已跳过：' + str(p.relative_to(src)))
                 continue
@@ -146,6 +168,7 @@ def make_plan(options, config, cancel=lambda: False):
             actions.append({'type': options.get('subtitle_mode', 'copy'), 'source': str(p), 'target': str(out), 'signature': signature(p)})
     for p in cleanup_files:
         actions.append({'type': 'trash', 'source': str(p), 'signature': signature(p)})
+    report.update(force=True, phase='ready', current='')
     return {'id': uuid.uuid4().hex, 'created': time.time(), 'options': dict(options, source=str(src), target=str(dst), mode=mode),
             'actions': actions, 'warnings': warnings, 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
             'config_fingerprint': config_fingerprint(config)}
