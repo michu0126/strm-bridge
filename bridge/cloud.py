@@ -187,6 +187,8 @@ class Clouds:
                 if w['options']['source'].startswith('cloud://' + identifier + '/'):
                     w.update(enabled=False, last_error='网盘账号已移除')
                     self.state.watcher.put(w)
+        if hasattr(self.state, 'uploads'):
+            self.state.uploads.account_removed(identifier)
         return {'ok': True}
 
     def remember(self, account, obj):

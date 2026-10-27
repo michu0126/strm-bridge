@@ -274,6 +274,18 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status,200)
         return {'Cookie':headers['Set-Cookie'].split(';')[0]}
     def test_api_requires_auth(self): self.assertEqual(self.request('/api/config')[0],401)
+    def test_upload_api_requires_auth_and_browse_limits_local_paths(self):
+        from urllib.parse import quote
+        self.assertEqual(self.request('/api/uploads')[0],401)
+        self.assertEqual(self.request('/api/uploads',{})[0],401)
+        headers=self.login()
+        self.state.config.update(upload_roots=[self.temp.name],source_roots=[],target_roots=[])
+        status,_,body=self.request('/api/browse?kind=upload_source',headers=headers)
+        self.assertEqual(status,200);self.assertEqual(json.loads(body)['roots'],[self.temp.name])
+        outside=str(Path(self.temp.name).parent)
+        self.assertEqual(self.request('/api/browse?kind=upload_source&path='+quote(outside),headers=headers)[0],400)
+        self.assertEqual(self.request('/api/browse?kind=upload_target&path='+quote(self.temp.name),headers=headers)[0],400)
+        self.assertEqual(self.request('/api/uploads',{},dict(headers,Origin='http://evil.invalid'))[0],403)
     def test_config_does_not_expose_secret(self):
         self.state.config['cd2_token']='sensitive'
         self.state.config['openlist_password']='openlist-sensitive'

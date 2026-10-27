@@ -28,7 +28,8 @@ class Cookie115(Provider):
         d = self.raw(endpoint if endpoint.startswith('https://') else self.base+endpoint, method,
                      query=query, body=body, form=form,
                      headers={'Cookie': self.c['cookie'], 'Referer': 'https://115.com/',
-                              'User-Agent': 'Mozilla/5.0 115Browser/27.0.5.7', **(headers or {})})
+                              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                            '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', **(headers or {})})
         if not d.get('state') or d.get('_http_status', 200) >= 400:
             code = d.get('errno', d.get('errNo', d.get('code', '')))
             raise CloudError('115 请求失败（代码 '+str(code)+'），请检查 Cookie 是否有效及下载权限')
@@ -55,7 +56,8 @@ class Cookie115(Provider):
                 if identifier in seen:
                     raise CloudError('115 分页重复，请重新扫描')
                 seen.add(identifier)
-                yield item(identifier, r['n'], folder, r.get('s'), r.get('te', r.get('t', 0)), pickcode=r.get('pc', ''))
+                yield item(identifier, r['n'], folder, r.get('s'), r.get('te', r.get('t', 0)),
+                           pickcode=r.get('pc', ''), sha1=r.get('sha', ''))
             offset += len(rows)
             if offset >= int(d['count']):
                 return
@@ -80,6 +82,10 @@ class Cookie115(Provider):
     def mkdir(self, parent, name):
         d = self.request('/files/add', 'POST', form={'pid': parent, 'cname': name})
         return str(d['cid'])
+
+    def upload(self, path, parent, sha1, **kwargs):
+        from .upload115 import upload
+        return upload(self, path, parent, sha1, **kwargs)
 
     def move(self, obj, destination):
         self.request('/files/move', 'POST', form={'pid': destination, 'fid[0]': obj['id']})

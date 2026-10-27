@@ -15,7 +15,21 @@
 - 外观设置：8 组配色（松石绿、海盐蓝、暮光紫、蔷薇粉、琥珀金、青瓷色、星夜靛、石墨灰），每组均支持深色、浅色、跟随系统；实时调整面板透明度。背景可选 Bing 每日壁纸、手动上传或渐变。Bing 图片按日缓存在 NAS，上传图片持久保存于 `/data/appearance`，支持 JPG/PNG/WebP/GIF/AVIF，最大 10MB。SB 字母标识与配色联动；主题、颜色、透明度和背景选择自动保存在当前浏览器。
 - 监控只补充不存在的 STRM 和字幕，字幕一律复制，不自动移动、清理、覆盖或删除文件。最近 1 分钟内修改的文件延后到下一轮，挂载暂时不可用时记录错误并重试。新增和失败任务进入任务记录；无变化不会不断生成空任务。
 - 独立管理密码、HttpOnly 会话、跨站请求检查、路径范围校验、带 HMAC 的长期播放入口。
-- Python 标准库实现，无第三方运行依赖。Dockerfile 支持 amd64 / arm64 构建；发布标签的平台以镜像清单为准。
+- 115 自动上传使用 p115oss / p115cipher 上传组件，其他服务使用 Python 标准库。Dockerfile 支持 amd64 / arm64 构建；发布标签的平台以镜像清单为准。
+
+## 本地目录自动上传到 115
+
+进入“目录监控 → 自动上传到 115”，手动填写或选择 **NAS 本地目录**，再从已登录的 115 中选择目标文件夹。可以建立多组目录对应关系，各自设置检查间隔和文件稳定时间；支持暂停、继续、立即检查、重试和移除监控。
+
+- 默认只上传创建监控后新增的文件；勾选“首次也上传已有文件”后才处理原有内容。
+- 递归保留子目录，上传所有文件类型，跳过常见下载临时文件。大小、时间等属性连续稳定后才上传。
+- 默认保留 NAS 原文件；可勾选“上传成功后删除本地文件”，只删除网盘大小、SHA1 已核对一致且未变化的本地文件，失败或冲突时保留；目标同名且大小、SHA1 一致时跳过，不同内容提示冲突，不覆盖。任务记录显示结果。分片上传进度持久保存，暂停或重启后继续；完成后再次核对 115 文件列表中的大小和 SHA1。
+- 需要 Cookie / 扫码登录的原生 115 账号。网盘上传权限、空间和频率限制仍然适用。无需 OpenList、CD2 或桌面 115 客户端。
+- 默认可选目录来自已挂载的本地源和媒体库。使用单独上传目录时，在 `.env` 填写 `UPLOAD_DIR`，取消 `compose.yaml` 中 `/upload:ro` 卷的注释，并将 `UPLOAD_ROOTS` 改为 `'["/upload"]'`，重新启动原项目。保留本地时只需读取权限；启用上传后删除时，将卷改为 `/upload:rw`。
+
+115 存储端若返回 `403 / AccessDenied`，任务会保留本地文件并重试；可在 115 官方网页上传小文件核对服务端是否也拒绝上传。
+
+该监控独立于 STRM 目录监控，两种功能可以同时使用。移除上传监控只移除规则和队列记录，保留本地与网盘文件。
 
 ## 添加网盘
 
@@ -112,7 +126,7 @@ docker compose -p strm-bridge up -d
 
 ## 接口依据与验证范围
 
-网盘适配器使用 Python 标准库，没有内嵌或启动 OpenList 程序。接口字段核对参考：[115 开放接口 SDK](https://github.com/OpenListTeam/115-sdk-go)、[百度网盘开放平台](https://pan.baidu.com/union/doc/)、[阿里云盘开放平台](https://www.alipan.com/developer)、[123 开放平台](https://www.123pan.com/developer)、[OpenList 驱动的协议使用](https://github.com/OpenListTeam/OpenList/tree/main/drivers)。115 加密传输格式适配自 MIT 许可的 [SheltonZhu/115driver](https://github.com/SheltonZhu/115driver)，声明保存在 `bridge/licenses/115driver-LICENSE.txt`，随镜像发布。
+网盘浏览和播放适配器使用 Python 标准库，没有内嵌或启动 OpenList 程序。接口字段核对参考：[115 开放接口 SDK](https://github.com/OpenListTeam/115-sdk-go)、[百度网盘开放平台](https://pan.baidu.com/union/doc/)、[阿里云盘开放平台](https://www.alipan.com/developer)、[123 开放平台](https://www.123pan.com/developer)、[OpenList 驱动的协议使用](https://github.com/OpenListTeam/OpenList/tree/main/drivers)。115 加密传输格式适配自 MIT 许可的 [SheltonZhu/115driver](https://github.com/SheltonZhu/115driver)，声明保存在 `bridge/licenses/115driver-LICENSE.txt`，随镜像发布。
 
 自动测试覆盖五种接口的请求参数、分页、授权续期和错误处理，以及无挂载源的生成、字幕、清理恢复和监控。协议测试使用模拟网盘响应；每个真实账号仍需在界面测试连接与实际播放器验证。不会把模拟测试当成五家真实网盘播放已验证。
 
@@ -128,6 +142,7 @@ GitHub Actions 执行测试后构建 `linux/amd64,linux/arm64`。在仓库中配
 ## 本地开发与测试
 
 ```bash
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 DATA_DIR=./data SOURCE_ROOTS='["/mnt/cloud"]' TARGET_ROOTS='["/mnt/library"]' python -m bridge.server
 ```

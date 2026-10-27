@@ -11,12 +11,16 @@ services:
       PUBLIC_URL: ${PUBLIC_URL:-http://NAS-IP:18642}
       SOURCE_ROOTS: '[]'
       TARGET_ROOTS: '["/library"]'
+      # 启用下方 /upload 卷时改为 '["/upload"]'；空数组使用已挂载的源目录和媒体库。
+      UPLOAD_ROOTS: '[]'
     volumes:
       - ./data:/data
       # 在项目同目录的 .env 中填写 LIBRARY_DIR，为 NAS 上的 Emby 媒体库目录。
       - ${LIBRARY_DIR:?请在 .env 填写媒体库路径 LIBRARY_DIR}:/library:rw
       # 可选：继续使用本地挂载源时，增加卷，并把 SOURCE_ROOTS 改为 '["/cloud"]'。
       # - /你的挂载目录:/cloud:rw,rslave
+      # 可选：监测 NAS 本地文件并上传到 115；填写 UPLOAD_DIR 并设置上方 UPLOAD_ROOTS。
+      # - ${UPLOAD_DIR:?请在 .env 填写本地上传目录 UPLOAD_DIR}:/upload:ro
     mem_limit: 384m
     security_opt:
       - no-new-privileges:true

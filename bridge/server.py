@@ -19,6 +19,7 @@ from . import __version__
 from .core import VIDEO, SUB, SKIP_DIRS, inside, make_plan, execute
 from .resolver import valid_url, resolve, test_connection
 from .watcher import Watcher
+from .upload_watcher import UploadWatcher
 from .appearance import Wallpapers, MAX_IMAGE
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
@@ -55,17 +56,24 @@ class State:
         self.config.setdefault('default_mode', 'redirect' if self.config['provider'] != 'none' else 'path')
         self.config.setdefault('emby_url', '')
         self.config.setdefault('webdav_enabled', False)
+        if 'UPLOAD_ROOTS' in os.environ:
+            self.config['upload_roots'] = json.loads(os.environ['UPLOAD_ROOTS'])
+        else:
+            self.config.setdefault('upload_roots', [])
         if not self.config_path.exists():
             self.save_config()
         for row in self.db.execute('SELECT id,value FROM jobs').fetchall():
             j = json.loads(row[1])
             if j['status'] in ('running', 'scanning', 'queued'):
-                j.update(status='interrupted', error='服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
+                message = ('服务重启，上传监控将在启用后自动继续。' if j.get('type') == 'upload' else
+                           '服务重启中断了任务，请重新预览。已完成操作保留，可查看回收记录。')
+                j.update(status='interrupted', error=message)
                 self.put_job(j)
         self.clouds = Clouds(self)
         self.dav_cache = webdav.DirectoryCache(self)
         self.cloud_login = CloudLogin()
         self.watcher = Watcher(self)
+        self.uploads = UploadWatcher(self)
         self.wallpapers = Wallpapers(self.data)
 
     def secret(self, name):
@@ -328,13 +336,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(data, content_type=mime)
             if path == '/api/browse':
                 kind = query.get('kind', ['source'])[0]
-                roots = self.state.config['source_roots' if kind == 'source' else 'target_roots']
+                roots = self.state.uploads.roots() if kind == 'upload_source' else self.state.config['source_roots' if kind == 'source' else 'target_roots']
                 requested = query.get('path', [''])[0]
-                if kind == 'source' and is_cloud(requested):
+                if kind in ('source', 'upload_target') and is_cloud(requested):
+                    if kind == 'upload_target':
+                        from .cloud import parse_uri
+                        account, _ = parse_uri(requested)
+                        a = self.state.clouds.account(account)
+                        if a['provider'] != '115' or a['credentials'].get('auth_mode') != 'cookie':
+                            raise ValueError('请选择使用 Cookie / 扫码登录的 115 账号')
                     return self.respond(self.state.clouds.browse(requested))
                 if not requested:
+                    if kind == 'upload_target':
+                        cloud_dirs = [{'name': a['name'], 'path': a['source']} for a in self.state.clouds.list_accounts()
+                                      if a['provider'] == '115' and a['credentials'].get('auth_mode') == 'cookie']
+                        return self.respond({'path': '', 'directories': cloud_dirs})
                     cloud_dirs = [{'name': a['name'], 'path': a['source']} for a in self.state.clouds.list_accounts()] if kind == 'source' else []
                     return self.respond({'roots': roots, 'path': '', 'directories': cloud_dirs + [{'name': r, 'path': r} for r in roots]})
+                if kind == 'upload_target':
+                    raise ValueError('请选择 115 网盘文件夹')
                 p = inside(requested, roots)
                 if not p.is_dir():
                     raise ValueError('目录不存在或挂载未就绪')
@@ -344,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(self.state.jobs())
             if path == '/api/watches':
                 return self.respond(self.state.watcher.list())
+            if path == '/api/uploads':
+                return self.respond(self.state.uploads.list())
             if path.startswith('/api/jobs/'):
                 job = self.state.job(path.rsplit('/', 1)[-1])
                 if 'plan' in job:
@@ -353,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'logo.svg'):
+        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'logo.svg'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
@@ -423,6 +445,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(self.state.clouds.test(data['id']))
         if self.path == '/api/watches':
             return self.respond(self.state.watcher.save(data))
+        if self.path == '/api/uploads':
+            return self.respond(self.state.uploads.save(data))
+        if self.path in ('/api/uploads/check', '/api/uploads/retry', '/api/uploads/delete'):
+            return self.respond(self.state.uploads.control(data['id'],
+                retry=self.path.endswith('/retry'), delete=self.path.endswith('/delete')))
         if self.path == '/api/watches/delete':
             return self.respond(self.state.watcher.delete(data['id']))
         if self.path == '/api/watches/check':
@@ -489,6 +516,7 @@ def main():
     server = ThreadingHTTPServer((os.environ.get('BIND_HOST', '0.0.0.0'), int(os.environ.get('PORT', '18642'))), Handler)
     server.state = state
     state.watcher.start()
+    state.uploads.start()
     print('STRM Bridge ' + __version__ + ' is ready. Admin password: ' + str(state.data / 'admin-password.txt'), flush=True)
     server.serve_forever()
 
