@@ -61,7 +61,10 @@ class GeneratedRecords:
                     same_output = signature(target) == record['target_signature']
                 except OSError:
                     pass
-                if same_output and action['signature'] == record['action']['signature'] and record['config_fingerprint'] == plan['config_fingerprint']:
+                source_unchanged = action['signature'] == record['action']['signature']
+                if action.get('remote',{}).get('sha1'):
+                    source_unchanged = source_unchanged and action['remote']['sha1'].upper() == record['action'].get('remote',{}).get('sha1','').upper()
+                if same_output and source_unchanged and record['config_fingerprint'] == plan['config_fingerprint']:
                     skipped += 1
                     continue
             managed = record or removed.get(key)

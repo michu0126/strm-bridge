@@ -38,6 +38,15 @@ class Watcher:
                 if not watch:
                     raise ValueError('监控不存在')
                 watch['enabled'] = data.get('enabled', watch['enabled']) is True
+                if 'interval' in data:
+                    interval=int(data['interval'])
+                    if not 60<=interval<=86400:raise ValueError('检查间隔需为 1 分钟至 24 小时')
+                    watch['interval']=interval
+                if 'reconcile' in data:
+                    options = dict(watch['options'], reconcile=data['reconcile'] is True)
+                    if options['reconcile']:
+                        state.reconciler.validate(options, live=False)
+                    watch['options'] = options
                 watch['next_run'] = time.time()
                 if not watch['enabled'] and self.active_id == watch['id'] and state.busy:
                     state.cancelled.add(state.busy)
@@ -62,6 +71,8 @@ class Watcher:
                 if not 60 <= interval <= 86400:
                     raise ValueError('检查间隔需为 1 分钟至 24 小时')
                 options.update(source=str(source), target=str(target), cleanup=False, subtitle_mode='copy')
+                if options.get('reconcile'):
+                    state.reconciler.validate(options, live=False)
                 if any(w['options']['source'] == str(source) and w['options']['target'] == str(target) for w in self.list()):
                     raise ValueError('此目录组合已有监控，请在监控列表中启用')
                 watch = {'id': uuid.uuid4().hex, 'options': options, 'interval': interval, 'enabled': True,
@@ -106,16 +117,17 @@ class Watcher:
             plan = state.make_plan(watch['options'], config, cancel, state.scan_progress(job))
             # New files and explicitly managed regeneration only; never move or clean up.
             # A recently modified source is retried on the next pass.
-            plan['actions'] = [a for a in plan['actions'] if a['type'] in ('strm', 'copy')
+            plan['actions'] = [a for a in plan['actions'] if a['type']=='retire' or (a['type'] in ('strm', 'copy')
                                and (not Path(a['target']).exists() or a.get('managed_hash'))
-                               and (a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime) <= time.time() - 60]
-            plan['counts'] = {k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash')}
+                               and (plan['options'].get('reconcile') or (a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime) <= time.time() - 60))]
+            plan['counts'].update({k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash', 'retire')})
             if plan['actions']:
                 job.update(status='running', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
                 state.put_job(job)
                 recorded = True
                 progress = ExecutionProgress(state, job)
-                result = state.execute(plan, config, state.playback, progress, cancel)
+                result = state.execute(plan, config, state.playback, progress, cancel,
+                    lambda kind, value: state.journal(job_id, kind, value))
                 job.update(status='cancelled' if result['cancelled'] else ('partial' if result['errors'] else 'completed'), result=result)
                 watch.update(last_status=job['status'], last_job=job_id, last_result=result,
                              last_error='；'.join(e['message'] for e in result['errors'][:3]))
@@ -135,6 +147,8 @@ class Watcher:
                 current = next((w for w in self.list() if w['id'] == watch['id']), None)
                 if current:
                     watch['enabled'] = current['enabled']
+                    watch['options'] = current['options']
+                    watch['interval'] = current['interval']
                     watch['next_run'] = time.time() + watch['interval']
                     self.put(watch)
                 state.busy = None

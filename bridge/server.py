@@ -23,6 +23,8 @@ from .watcher import Watcher
 from .upload_watcher import UploadWatcher
 from .appearance import Wallpapers, MAX_IMAGE
 from .generated import GeneratedRecords
+from .reconcile import Reconciler
+from .videos import VideoLibrary
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
 from .cloud_login import CloudLogin
@@ -75,10 +77,12 @@ class State:
                 self.put_job(j)
         self.clouds = Clouds(self)
         self.generated = GeneratedRecords(self)
+        self.reconciler = Reconciler(self)
         self.dav_cache = webdav.DirectoryCache(self)
         self.cloud_login = CloudLogin()
         self.watcher = Watcher(self)
         self.uploads = UploadWatcher(self)
+        self.videos = VideoLibrary(self)
         self.wallpapers = Wallpapers(self.data)
 
     def secret(self, name):
@@ -156,8 +160,13 @@ class State:
 
     def make_plan(self, options, config, cancel=lambda: False, progress=lambda info: None):
         self.generated.backfill(cancel)
+        if options.get('reconcile'):
+            self.reconciler.validate(options)
         plan = self.clouds.plan(options, config, cancel, progress) if is_cloud(options['source']) else make_plan(options, config, cancel, progress)
-        return self.generated.filter(plan, config)
+        if options.get('reconcile'):
+            self.reconciler.prepare(plan)
+        plan = self.generated.filter(plan, config)
+        return self.reconciler.finish_plan(plan) if options.get('reconcile') else plan
 
     def scan_progress(self, job):
         def update(info):
@@ -168,7 +177,12 @@ class State:
     def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
         runner = self.clouds.execute if 'account' in plan else execute
         try:
-            return runner(plan, config, playback, progress, cancel, journal, generated=self.generated)
+            normal = dict(plan, actions=[a for a in plan['actions'] if a['type']!='retire'])
+            update = lambda done, total, path: progress(done, len(plan['actions']), path)
+            result = runner(normal, config, playback, update, cancel, journal, generated=self.generated)
+            if plan['options'].get('reconcile'):
+                result = self.reconciler.execute(plan, config, result, progress, cancel, journal)
+            return result
         finally:
             self.generated.flush()
 
@@ -232,9 +246,16 @@ class State:
             if self.busy:
                 raise ValueError('请等待当前任务完成')
             job = self.job(job_id)
+            if job.get('options', {}).get('reconcile'):
+                self.busy = 'restore:' + job_id
             if 'account' in job['plan']:
                 # Network requests must not hold the SQLite/state lock.
                 self.busy = 'restore:' + job_id
+        if job.get('options', {}).get('reconcile'):
+            try:
+                return self.reconciler.restore(job)
+            finally:
+                with self.lock:self.busy=None
         if 'account' in job['plan']:
             try:
                 return self.clouds.restore(job_id)
@@ -381,12 +402,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(data, content_type=mime)
             if path == '/api/browse':
                 kind = query.get('kind', ['source'])[0]
-                if kind not in ('source', 'target', 'upload_source', 'upload_files', 'upload_target'):
+                if kind not in ('source', 'target', 'cloud_source', 'upload_source', 'upload_files', 'upload_target'):
                     raise ValueError('目录选择类型无效')
                 roots = self.state.uploads.roots() if kind in ('upload_source', 'upload_files') else self.state.config['source_roots' if kind == 'source' else 'target_roots']
                 requested = query.get('path', [''])[0]
-                if kind in ('source', 'upload_target') and is_cloud(requested):
-                    if kind == 'upload_target':
+                if kind in ('source', 'cloud_source', 'upload_target') and is_cloud(requested):
+                    if kind in ('cloud_source','upload_target'):
                         from .cloud import parse_uri
                         account, _ = parse_uri(requested)
                         a = self.state.clouds.account(account)
@@ -394,13 +415,13 @@ class Handler(BaseHTTPRequestHandler):
                             raise ValueError('请选择使用 Cookie / 扫码登录的 115 账号')
                     return self.respond(self.state.clouds.browse(requested))
                 if not requested:
-                    if kind == 'upload_target':
+                    if kind in ('cloud_source','upload_target'):
                         cloud_dirs = [{'name': a['name'], 'path': a['source']} for a in self.state.clouds.list_accounts()
                                       if a['provider'] == '115' and a['credentials'].get('auth_mode') == 'cookie']
                         return self.respond({'path': '', 'directories': cloud_dirs})
                     cloud_dirs = [{'name': a['name'], 'path': a['source']} for a in self.state.clouds.list_accounts()] if kind == 'source' else []
                     return self.respond({'roots': roots, 'path': '', 'directories': cloud_dirs + [{'name': r, 'path': r} for r in roots]})
-                if kind == 'upload_target':
+                if kind in ('cloud_source','upload_target'):
                     raise ValueError('请选择 115 网盘文件夹')
                 p = inside(requested, roots)
                 if not p.is_dir():
@@ -420,6 +441,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({'roots': roots, 'path': str(p), 'parent': str(p.parent) if str(p) not in roots else '', 'directories': sorted(directories, key=lambda d: d['name'].casefold())})
             if path == '/api/generated':
                 return self.respond(self.state.generated.list(query.get('offset',['0'])[0],query.get('search',[''])[0]))
+            if path == '/api/videos/scans':
+                return self.respond(self.state.videos.list())
+            if path.startswith('/api/videos/rows/'):
+                return self.respond(self.state.videos.rows(path.rsplit('/',1)[-1],query.get('offset',['0'])[0],query.get('filter',['low'])[0]))
+            if path.startswith('/api/videos/ids/'):
+                identifier=path.rsplit('/',1)[-1]
+                self.state.videos.get(identifier)
+                with self.state.lock:
+                    rows=self.state.db.execute("SELECT id FROM video_rows WHERE scan=? AND json_extract(value,'$.low')=1 AND json_extract(value,'$.operation') IS NULL LIMIT 5001",(identifier,)).fetchall()
+                return self.respond({'ids':[row[0] for row in rows]})
             if path == '/api/jobs':
                 return self.respond(self.state.jobs())
             if path == '/api/watches':
@@ -437,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'generated.js', 'logo.svg'):
+        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'generated.js', 'cloud-tools.js', 'logo.svg'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
@@ -514,6 +545,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(self.state.start_scan(record['options'], regenerate=data['id']), 202)
         if self.path == '/api/scan':
             return self.respond(self.state.start_scan(data), 202)
+        if self.path == '/api/reconcile':
+            options = dict(data, reconcile=True, cleanup=False, subtitle_mode='copy', mode='redirect')
+            return self.respond(self.state.start_scan(options), 202)
+        if self.path == '/api/videos/scan':
+            return self.respond(self.state.videos.start(data), 202)
+        if self.path == '/api/videos/batch':
+            return self.respond(self.state.videos.batch(data), 202)
+        if self.path == '/api/videos/cancel':
+            self.state.videos.get(data['id'])
+            self.state.cancelled.add(data['id'])
+            return self.respond({'ok':True})
         if self.path == '/api/clouds/login/start':
             return self.respond(self.state.cloud_login.start(data.get('provider')))
         if self.path == '/api/clouds/login/status':

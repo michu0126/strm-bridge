@@ -273,6 +273,15 @@ class ServerTests(unittest.TestCase):
         status,headers,_=self.request('/api/login',{'password':self.state.password})
         self.assertEqual(status,200)
         return {'Cookie':headers['Set-Cookie'].split(';')[0]}
+    def test_cloud_tools_routes_require_auth_and_cloud_only_browse(self):
+        for path in ['/api/videos/scans','/api/videos/rows/missing','/api/videos/ids/missing']:
+            self.assertEqual(self.request(path)[0],401)
+        for path in ['/api/reconcile','/api/videos/scan','/api/videos/batch','/api/videos/cancel']:
+            self.assertEqual(self.request(path,{})[0],401)
+        headers=self.login()
+        self.assertEqual(self.request('/api/videos/scans',headers=headers)[0],200)
+        self.assertEqual(self.request('/api/browse?kind=cloud_source&path=/tmp',headers=headers)[0],400)
+        self.assertEqual(self.request('/cloud-tools.js')[0],200)
     def test_generated_ledger_api_requires_auth_and_serves_script(self):
         self.assertEqual(self.request('/api/generated')[0],401)
         self.assertEqual(self.request('/api/generated/delete',{'ids':['x']})[0],401)

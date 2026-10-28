@@ -384,6 +384,8 @@ class Clouds:
         files, visited, todo = {}, set(), [(root, PurePosixPath('.'))]
         revision = self.account(account)['revision']
         key = hashlib.sha256((account + ':' + str(revision) + ':' + root).encode()).hexdigest()
+        if options.get('reconcile'):
+            key += ':' + uuid.uuid4().hex  # Reconciliation never reuses an interrupted snapshot.
         report = ScanProgress(progress)
         report.update(force=True)
         with self.client(account) as client:
@@ -568,6 +570,8 @@ class Clouds:
                         current = checked[obj['parent']].get(obj['id'])
                         if current is None or signature(current) != action['signature']:
                             raise CloudError('云端文件已变更，请重新扫描')
+                        if current.get('sha1') and obj.get('sha1') and current['sha1'].upper()!=obj['sha1'].upper():
+                            raise CloudError('云端文件内容已变更，请重新扫描')
                         target = inside(action['target'], [dst])
                         if kind == 'strm':
                             data = (playback({'account': account, 'object': obj}) + '\n').encode()

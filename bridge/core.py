@@ -11,7 +11,7 @@ from .progress import ScanProgress
 
 VIDEO = set(('3g2 3gp 3gp2 3gpp amv asf avi avs bdav bik bink dat divx dpg dv evo f4v flc fli flv h264 h265 hdmov hevc img iso ivf m1v m2p m2t m2ts m2v m4v m4p mk3d mkv mov mp2v mp4 mpe mpeg mpg mpv mts mxf nsv nut ogm ogv ogx qt ram rec rm rmvb rpl smk svi tod tp trp ts vdr vob vro webm wm wmv wtv xvid y4m').split())
 SUB = set('srt ass ssa sub idx vtt sup smi sami txt ttml dfxp sbv scc stl lrc usf aqt jss mpl pjs rt sst tts'.split())
-SKIP_DIRS = {'.strm-trash', '.snapshot', '#recycle', '@eaDir', '$RECYCLE.BIN', '.git', 'lost+found'}
+SKIP_DIRS = {'.strm-trash', '.strm-sync-trash', '.snapshot', '#recycle', '@eaDir', '$RECYCLE.BIN', '.git', 'lost+found'}
 CLEANUP_LIMIT = 100_000_000
 EPISODE = re.compile(r'(?:s(\d{1,3})[ ._-]*e(\d{1,4})(?!\d)|(\d{1,3})x(\d{1,4})(?!\d))', re.I)
 

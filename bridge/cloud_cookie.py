@@ -117,6 +117,22 @@ class Cookie115(Provider):
         d = self.request('/files/add', 'POST', form={'pid': parent, 'cname': name})
         return str(d['cid'])
 
+    def video_info(self, obj):
+        d = self.request('/files/video', query={'pickcode':obj['pickcode'], 'local':0, 'supports_origin_file':1})
+        if d.get('file_id') and str(d['file_id']) != obj['id']:
+            raise CloudError('视频信息与文件不一致，请重新扫描')
+        # width/height describe the original file. Never infer source resolution
+        # from available transcode definitions or from a filename.
+        try:
+            width, height = int(d.get('width',0)), int(d.get('height',0))
+        except (TypeError, ValueError):
+            width, height = 0, 0
+        return {'width':width if 0<width<=65536 else 0, 'height':height if 0<height<=65536 else 0}
+
+    def delete(self, obj):
+        # Standard 115 deletion goes through its recycle bin; never purge it.
+        self.request('/rb/delete', 'POST', form={'fid[0]':obj['id'], 'pid':obj['parent']})
+
     def upload(self, path, parent, sha1, **kwargs):
         from .upload115 import upload
         return upload(self, path, parent, sha1, **kwargs)
