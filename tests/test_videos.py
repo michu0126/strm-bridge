@@ -21,8 +21,15 @@ class VideoClient:
     def list(self,parent):return iter(copy.deepcopy(self.tree[parent]))
     def directory_path(self,parent):
         if parent not in self.tree:raise CloudError('missing directory')
-        return []
-    def recursive_pages(self,parent):yield [dict(o,parent=parent) for o in copy.deepcopy(self.tree[parent]) if not o['folder']]
+        if parent=='0':return [{'id':'0','name':'','parent':'0'}]
+        for key,rows in self.tree.items():
+            node=next((o for o in rows if o['id']==parent and o['folder']),None)
+            if node:return self.directory_path(key)+[dict(id=parent,name=node['name'],parent=key)]
+        raise CloudError('missing parent')
+    def recursive_pages(self,parent):
+        yield [dict(o,parent=parent) for o in copy.deepcopy(self.tree[parent]) if not o['folder']]
+        for obj in self.tree[parent]:
+            if obj['folder']:yield from self.recursive_pages(obj['id'])
     def video_info(self,obj):
         self.calls.append(obj['id']);w,h=self.dimensions[obj['id']];return {'width':w,'height':h}
     def move(self,obj,destination):
@@ -43,7 +50,9 @@ class VideoTests(unittest.TestCase):
     def scan(self,**kwargs):
         s=self.state.videos.start(dict(self.options,**kwargs));self.state.videos.pool.submit(lambda:None).result(timeout=10);return self.state.videos.get(s['id'])
     def operation(self,scan,operation,ids=['low']):
-        task=self.state.videos.batch({'scan_id':scan['id'],'operation':operation,'ids':ids,'target':uri(self.account['id'],'dest')})
+        data={'scan_id':scan['id'],'operation':operation,'ids':ids,'target':uri(self.account['id'],'dest')}
+        if operation=='move':data['preview_id']=self.state.videos.move_preview(data)['id']
+        task=self.state.videos.batch(data)
         self.state.videos.pool.submit(lambda:None).result(timeout=10);return self.state.videos.get(task['id'])
     def test_thresholds_crops_portrait_and_unknown(self):
         self.assertTrue(below(640,360));self.assertTrue(below(720,1280));self.assertFalse(below(1920,800));self.assertTrue(below(1920,800,rule='height'));self.assertFalse(below(1920,1080));self.assertFalse(below(0,720))
@@ -55,10 +64,12 @@ class VideoTests(unittest.TestCase):
         self.client.tree['source'][0]['size']+=1;self.scan();self.assertEqual(len(self.client.calls),5)
     def test_strict_height_mode_detects_cropped_video(self):
         scan=self.scan(rule='height');self.assertEqual(scan['matched'],2)
-    def test_move_is_verified_and_existing_target_is_not_overwritten(self):
-        scan=self.scan();task=self.operation(scan,'move');self.assertEqual(task['result']['moved'],1);self.assertEqual(task['status'],'completed')
-        self.assertEqual(self.client.tree['dest'][0]['id'],'low');self.assertIsNone(self.state.busy)
+    def test_move_entire_parent_folder_including_unselected_files(self):
+        scan=self.scan(source=self.account['source']);task=self.operation(scan,'move');self.assertEqual(task['result']['moved'],1);self.assertEqual(task['status'],'completed')
+        self.assertEqual(self.client.tree['dest'][0]['id'],'source');self.assertIsNone(self.state.busy)
+        self.assertEqual(self.client.operations,[('move','source')]);self.assertEqual(len(self.client.tree['source']),4)
         self.assertEqual(self.state.videos.rows(scan['id'])['rows'][0]['operation'],'move')
+        self.assertTrue(all(r['operation']=='move' for r in self.state.videos.rows(scan['id'],filter_='all')['rows']))
     def test_delete_only_selected_confirmed_low_file_and_schedule_sync(self):
         library=self.root/'library';library.mkdir();self.state.config['target_roots']=[str(library)]
         watch=self.state.watcher.save({'options':dict(source=self.options['source'],target=str(library),kind='jav',mode='redirect',reconcile=True)})
@@ -74,8 +85,37 @@ class VideoTests(unittest.TestCase):
     def test_changed_source_and_destination_conflict_preserve_files(self):
         scan=self.scan();self.client.tree['source'][0]['size']+=100
         task=self.operation(scan,'delete');self.assertEqual(task['result']['deleted'],0);self.assertTrue(task['result']['errors'])
-        scan=self.scan();self.client.tree['dest'].append(item('conflict','360.mkv',False,10))
-        task=self.operation(scan,'move');self.assertEqual(task['result']['moved'],0);self.assertTrue(task['result']['errors']);self.assertEqual(self.client.operations,[])
+        scan=self.scan(source=self.account['source']);self.client.tree['dest'].append(item('conflict','Source',True))
+        with self.assertRaisesRegex(ValueError,'同名'):self.operation(scan,'move')
+        self.assertEqual(self.client.operations,[])
+    def test_move_requires_preview_and_rejects_scan_root_and_descendant(self):
+        scan=self.scan();data={'scan_id':scan['id'],'ids':['low'],'operation':'move','target':uri(self.account['id'],'dest')}
+        with self.assertRaisesRegex(ValueError,'预览'):self.state.videos.batch(data)
+        with self.assertRaisesRegex(ValueError,'扫描根目录'):self.state.videos.move_preview(data)
+        scan=self.scan(source=self.account['source']);data['scan_id']=scan['id']
+        for parent in ('source','sub'):
+            if parent=='sub':self.client.tree['source'].append(item('sub','Sub',True));self.client.tree['sub']=[]
+            data['target']=uri(self.account['id'],parent)
+            with self.assertRaisesRegex(ValueError,'自身'):self.state.videos.move_preview(data)
+        self.assertEqual(self.client.operations,[])
+    def test_same_folder_deduplicated_and_nested_selection_collapsed(self):
+        self.client.tree['source'].append(item('low2','720.mp4',False,200000000));self.client.dimensions['low2']=(1280,720)
+        self.client.tree['source'].append(item('sub','Sub',True));self.client.tree['sub']=[item('low3','480.mp4',False,100000000)];self.client.dimensions['low3']=(852,480)
+        scan=self.scan(source=self.account['source']);task=self.operation(scan,'move',['low','low2','low3'])
+        self.assertEqual(task['total'],1);self.assertEqual(task['result']['moved_videos'],3);self.assertEqual(self.client.operations,[('move','source')])
+    def test_changed_preview_content_and_expired_preview_never_move(self):
+        scan=self.scan(source=self.account['source']);data={'scan_id':scan['id'],'ids':['low'],'operation':'move','target':uri(self.account['id'],'dest')}
+        data['preview_id']=self.state.videos.move_preview(data)['id']
+        self.client.tree['source'].append(item('ad','ad.txt',False,100))
+        task=self.state.videos.batch(data);self.state.videos.pool.submit(lambda:None).result(timeout=10);task=self.state.videos.get(task['id'])
+        self.assertEqual(task['result']['moved'],0);self.assertIn('内容已改变',task['result']['errors'][0]['message']);self.assertEqual(self.client.operations,[])
+        with patch('bridge.videos.time.time',return_value=time.time()+601):
+            with self.assertRaisesRegex(ValueError,'过期'):self.state.videos.batch(data)
+    def test_conflict_after_preview_and_folder_relocation_do_not_move(self):
+        scan=self.scan(source=self.account['source']);data={'scan_id':scan['id'],'ids':['low'],'operation':'move','target':uri(self.account['id'],'dest')}
+        data['preview_id']=self.state.videos.move_preview(data)['id'];self.client.tree['dest'].append(item('conflict','Source',True))
+        task=self.state.videos.batch(data);self.state.videos.pool.submit(lambda:None).result(timeout=10)
+        self.assertIn('同名',self.state.videos.get(task['id'])['result']['errors'][0]['message']);self.assertEqual(self.client.operations,[])
     def test_scan_cancel_and_busy_generation_prevent_mutation(self):
         scan=self.scan();self.state.busy='generation'
         with self.assertRaises(ValueError):self.operation(scan,'delete')

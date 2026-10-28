@@ -276,7 +276,7 @@ class ServerTests(unittest.TestCase):
     def test_cloud_tools_routes_require_auth_and_cloud_only_browse(self):
         for path in ['/api/videos/scans','/api/videos/rows/missing','/api/videos/ids/missing']:
             self.assertEqual(self.request(path)[0],401)
-        for path in ['/api/reconcile','/api/videos/scan','/api/videos/batch','/api/videos/cancel']:
+        for path in ['/api/reconcile','/api/videos/scan','/api/videos/move-preview','/api/videos/batch','/api/videos/cancel']:
             self.assertEqual(self.request(path,{})[0],401)
         headers=self.login()
         self.assertEqual(self.request('/api/videos/scans',headers=headers)[0],200)

@@ -550,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(self.state.start_scan(options), 202)
         if self.path == '/api/videos/scan':
             return self.respond(self.state.videos.start(data), 202)
+        if self.path == '/api/videos/move-preview':
+            return self.respond(self.state.videos.move_preview(data))
         if self.path == '/api/videos/batch':
             return self.respond(self.state.videos.batch(data), 202)
         if self.path == '/api/videos/cancel':

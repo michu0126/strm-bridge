@@ -11,7 +11,7 @@
   function ruleHint(){const h=Number($('videoThreshold').value),w=Math.round(h*16/9);$('videoRuleHint').textContent=$('videoRule').value==='height'?`按原始画面高度 < ${h} 判断。`:`按短边 < ${h} 且长边 < ${w} 判断，保留达到长边标准的裁切影片。`;}
   $('videoThreshold').addEventListener('change',ruleHint);$('videoRule').addEventListener('change',ruleHint);ruleHint();
   let scans=[],current=null,batch=null,offset=0,total=0,rows=[],request=0;
-  const selected=new Set();
+  const selected=new Set();let movePreview=null;
   const states={scanning:'检测中',running:'操作中',completed:'完成',partial:'部分完成',cancelled:'已暂停',interrupted:'等待继续',failed:'失败'};
   function selection(){const running=current?.status==='scanning'||batch?.status==='running';$('videoSelectedCount').textContent=`已选 ${selected.size} 个低清影片`;$('moveSelectedVideos').disabled=!selected.size||running;$('deleteSelectedVideos').disabled=!selected.size||running;}
   async function refresh(){
@@ -38,7 +38,7 @@
     if(!rows.length){const tr=document.createElement('tr'),td=textElement('td','暂无符合条件的影片；检测过程中可刷新查看结果。');td.colSpan=4;tr.append(td);$('videoRows').append(tr);}
     $('videoPage').textContent=`${Math.floor(offset/100)+1} / ${Math.max(1,Math.ceil(total/100))} · ${total} 个`;$('videoPrev').disabled=offset===0;$('videoNext').disabled=offset+100>=total;
     const active=all.find(s=>['scanning','running'].includes(s.status));$('cancelVideoTask').disabled=!active;
-    if(batch){const r=batch.result||{};$('videoTaskResult').textContent=`最近批量操作：${states[batch.status]||batch.status} · ${batch.done} / ${batch.total} · 移动 ${r.moved||0} 个 · 删除 ${r.deleted||0} 个`+(r.errors?.length?' · '+r.errors.slice(0,3).map(x=>x.path+'：'+x.message).join('；'):'')+(batch.error?' · '+batch.error:'');}
+    if(batch){const r=batch.result||{};$('videoTaskResult').textContent=`最近批量操作：${states[batch.status]||batch.status} · ${batch.done} / ${batch.total} · 移动 ${r.moved||0} ${batch.move_scope==='folder'?`个文件夹（选中影片 ${r.moved_videos||0} 部）`:'个视频（旧版记录）'} · 删除 ${r.deleted||0} 个视频`+(r.errors?.length?' · '+r.errors.slice(0,3).map(x=>x.path+'：'+x.message).join('；'):'')+(batch.error?' · '+batch.error:'');}
     selection();
   }
   window.loadVideoTools=refresh;
@@ -61,8 +61,18 @@
     const target=$('videoMoveTarget').dataset.cloud;
     if(operation==='move'&&!target)throw Error('请选择同一 115 账号的移动目标');
     if(operation==='delete'&&!confirm(`将选中的 ${selected.size} 个网盘视频移入 115 回收站。已启用的目录同步会随后回收对应 STRM。确认删除？`))return;
-    batch=await api('/api/videos/batch',{scan_id:current.id,ids:[...selected],operation,target});selected.clear();await refresh();
+    const data={scan_id:current.id,ids:[...selected],operation,target};
+    if(operation==='move'){
+      const preview=await api('/api/videos/move-preview',data);movePreview={...data,preview_id:preview.id};
+      $('videoMoveSummary').textContent=`已选 ${preview.selected} 部低清影片，合并为 ${preview.folders.length} 个文件夹。`;
+      $('videoMoveFolders').replaceChildren();
+      for(const folder of preview.folders){const item=textElement('article','','move-folder-item');item.append(textElement('b',folder.source),textElement('p','→ '+folder.target),textElement('small',`选中 ${folder.selected} 部影片 · 当前目录 ${folder.entries} 个直接项目（含子目录时整体带走）`));$('videoMoveFolders').append(item);}
+      $('confirmVideoMove').textContent=`移动这 ${preview.folders.length} 个文件夹`;$('videoMoveDialog').showModal();return;
+    }
+    batch=await api('/api/videos/batch',data);selected.clear();await refresh();
   }
+  for(const id of ['closeVideoMove','cancelVideoMove'])$(id).addEventListener('click',()=>{$('videoMoveDialog').close();movePreview=null;});
+  $('confirmVideoMove').addEventListener('click',safe(async()=>{if(!movePreview)throw Error('请重新预览');const button=$('confirmVideoMove');button.disabled=true;try{batch=await api('/api/videos/batch',movePreview);movePreview=null;selected.clear();$('videoMoveDialog').close();await refresh();}finally{button.disabled=false;}}));
   $('moveSelectedVideos').addEventListener('click',safe(()=>operate('move')));$('deleteSelectedVideos').addEventListener('click',safe(()=>operate('delete')));
   setInterval(()=>{if(!$('videos').classList.contains('hidden'))refresh().catch(e=>toast(e.message));},3000);
   window.renderCloudToolsHistory=function(job){const card=textElement('article','','card history-card');card.append(textElement('b',job.type==='video_scan'?'视频分辨率检测':'网盘批量操作'),textElement('p',(states[job.status]||job.status)+' · '+(job.done||0)+' / '+(job.total||0)),textElement('small',job.options?.source||''));const button=textElement('button','查看检测结果');button.addEventListener('click',()=>changePage('videos'));card.append(button);$('historyList').append(card);};
