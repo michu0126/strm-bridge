@@ -273,6 +273,13 @@ class ServerTests(unittest.TestCase):
         status,headers,_=self.request('/api/login',{'password':self.state.password})
         self.assertEqual(status,200)
         return {'Cookie':headers['Set-Cookie'].split(';')[0]}
+    def test_generated_ledger_api_requires_auth_and_serves_script(self):
+        self.assertEqual(self.request('/api/generated')[0],401)
+        self.assertEqual(self.request('/api/generated/delete',{'ids':['x']})[0],401)
+        headers=self.login()
+        self.assertEqual(self.request('/api/generated',headers=headers)[0],200)
+        self.assertEqual(self.request('/api/generated/delete',{'ids':['x']},dict(headers,Origin='http://evil.invalid'))[0],403)
+        self.assertEqual(self.request('/generated.js')[0],200)
     def test_api_requires_auth(self): self.assertEqual(self.request('/api/config')[0],401)
     def test_upload_api_requires_auth_and_browse_limits_local_paths(self):
         from urllib.parse import quote
@@ -286,6 +293,44 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request('/api/browse?kind=upload_source&path='+quote(outside),headers=headers)[0],400)
         self.assertEqual(self.request('/api/browse?kind=upload_target&path='+quote(self.temp.name),headers=headers)[0],400)
         self.assertEqual(self.request('/api/uploads',{},dict(headers,Origin='http://evil.invalid'))[0],403)
+    def test_manual_upload_api_and_local_file_picker_require_auth(self):
+        from urllib.parse import quote
+        self.assertEqual(self.request('/api/uploads/manual')[0],401)
+        self.assertEqual(self.request('/api/uploads/manual',{})[0],401)
+        self.assertEqual(self.request('/api/uploads/staging',{})[0],401)
+        headers=self.login()
+        folder=Path(self.temp.name)/'uploads';folder.mkdir()
+        for i in range(205):(folder/('%03d.bin'%i)).write_bytes(b'data')
+        self.state.config.update(upload_roots=[str(folder)],source_roots=[],target_roots=[])
+        url='/api/browse?kind=upload_files&path='+quote(str(folder))
+        code,_,body=self.request(url,headers=headers);data=json.loads(body)
+        self.assertEqual(code,200);self.assertEqual(len(data['entries']),200);self.assertTrue(data['more'])
+        code,_,body=self.request(url+'&offset=200',headers=headers)
+        self.assertEqual(len(json.loads(body)['entries']),5)
+        self.assertEqual(self.request('/api/browse?kind=upload_files&path='+quote(self.temp.name),headers=headers)[0],400)
+        a=self.state.clouds.save({'provider':'115','credentials':{'auth_mode':'cookie','cookie':'UID=test; CID=test; SEID=test'}})
+        code,_,body=self.request('/api/uploads/manual',{'sources':[str(folder/'000.bin')],'target':a['source']},headers)
+        self.assertEqual(code,202);task=json.loads(body)
+        self.assertEqual(self.request('/api/uploads/manual/pause',{'id':task['id']},headers)[0],200)
+        self.assertFalse(self.state.uploads.get(task['id'])['enabled'])
+    def test_browser_file_transfer_auth_csrf_stream_and_finish(self):
+        headers=self.login()
+        a=self.state.clouds.save({'provider':'115','credentials':{'auth_mode':'cookie','cookie':'UID=test; CID=test; SEID=test'}})
+        code,_,body=self.request('/api/uploads/staging',{'files':[{'name':'test.bin','size':3}],'target':a['source']},headers)
+        self.assertEqual(code,202);task=json.loads(body)
+        path='/api/uploads/staging/'+task['id']+'/chunk'
+        def chunk(extra):
+            c=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=3)
+            c.request('POST',path,b'abc',{'Content-Type':'application/octet-stream','X-Upload-Index':'0','X-Upload-Offset':'0',**extra})
+            r=c.getresponse();code=r.status;r.read();c.close();return code
+        self.assertEqual(chunk({}),401)
+        self.assertEqual(chunk(dict(headers,Origin='http://evil.invalid')),403)
+        self.assertEqual(self.state.uploads.get(task['id'])['received_bytes'],0)
+        self.assertEqual(chunk(headers),200)
+        code,_,body=self.request('/api/uploads/staging/'+task['id'],headers=headers)
+        self.assertEqual(json.loads(body)['received_bytes'],3)
+        self.assertEqual(self.request('/api/uploads/staging/'+task['id']+'/finish',{},headers)[0],202)
+        self.assertEqual(self.state.uploads.get(task['id'])['last_status'],'queued')
     def test_config_does_not_expose_secret(self):
         self.state.config['cd2_token']='sensitive'
         self.state.config['openlist_password']='openlist-sensitive'

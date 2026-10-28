@@ -78,6 +78,10 @@ class DownloadRedirect(HTTPRedirectHandler):
         return redirected
 
 
+class RecursivePathConflict(Exception):
+    pass
+
+
 class Clouds:
     def __init__(self, state):
         self.state = state
@@ -298,6 +302,74 @@ class Clouds:
                 self.persist()
             raise
 
+    def recursive_files(self, account, root, cancel, report):
+        # Refresh direct child folders once. Most media folders are leaves: their
+        # contents come from the recursive file list, avoiding one request per film.
+        root_node = self.node(account, root)
+        with self.client(account) as client:
+            root_rows = self.entries(account, root, client, cancel, allow_duplicates=True)
+            pages = iter(client.recursive_pages(root))
+        names = scan_names(root_rows)
+        directories = {root:PurePosixPath('.')}
+        raw_paths = {root:root_node['path']}
+        owners = {PurePosixPath('.'):root}
+        blocked = set()
+        for obj in root_rows:
+            if obj['folder']:
+                relative = PurePosixPath(names[obj['id']])
+                directories[obj['id']] = relative
+                owners[relative] = obj['id']
+                raw_paths[obj['id']] = obj['path']
+                if obj['name'] in SKIP_DIRS:
+                    blocked.add(obj['id'])
+        groups, total = {}, 0
+        while True:
+            if cancel():
+                raise CloudError('任务已取消')
+            with self.client(account):
+                page = next(pages, None)
+            if page is None:
+                break
+            for obj in page:
+                safe_name(obj['name'])
+                parent = obj['parent']
+                if parent not in directories:
+                    with self.client(account) as client:
+                        chain = client.directory_path(parent)
+                    identifiers = [p['id'] for p in chain]
+                    if root not in identifiers:
+                        raise CloudError('云端文件已移出所选目录，请重新扫描')
+                    previous = root
+                    for node in chain[identifiers.index(root)+1:]:
+                        identifier = node['id']
+                        if identifier not in directories:
+                            relative = directories[previous] / safe_name(node['name'])
+                            if relative in owners and owners[relative] != identifier:
+                                raise RecursivePathConflict()
+                            directories[identifier] = relative
+                            owners[relative] = identifier
+                            raw_paths[identifier] = raw_paths[previous].rstrip('/')+'/'+node['name']
+                            if previous in blocked or node['name'] in SKIP_DIRS:
+                                blocked.add(identifier)
+                            self.remember(account,dict(item(identifier,node['name'],True),parent=previous,path=raw_paths[identifier]))
+                        previous = identifier
+                total += 1
+                if parent in blocked:
+                    continue
+                obj['path'] = raw_paths[parent].rstrip('/')+'/'+obj['name']
+                groups.setdefault(parent,[]).append(obj)
+            report.update(force=True,files=total,directories=len(directories),current='批量读取网盘文件',pending=0)
+        files, saved = {}, []
+        for parent, rows in groups.items():
+            names = scan_names(rows)
+            for obj in rows:
+                files[directories[parent]/names[obj['id']]] = obj
+                saved.append((account,obj['id'],json.dumps(obj,ensure_ascii=False)))
+        with self.state.lock:
+            self.state.db.executemany('INSERT OR REPLACE INTO cloud_nodes VALUES(?,?,?)',saved)
+            self.state.db.commit()
+        return files
+
     def plan(self, options, config, cancel=lambda: False, progress=lambda info: None):
         account, root = parse_uri(options['source'])
         dst = inside(options['target'], config['target_roots'])
@@ -314,6 +386,17 @@ class Clouds:
         key = hashlib.sha256((account + ':' + str(revision) + ':' + root).encode()).hexdigest()
         report = ScanProgress(progress)
         report.update(force=True)
+        with self.client(account) as client:
+            recursive = callable(getattr(client,'recursive_pages',None))
+        if recursive:
+            try:
+                files = self.recursive_files(account,root,cancel,report)
+                files = {p:o for p,o in files.items() if options.get('cleanup') or p.suffix.lower().lstrip('.') in ext or (options['kind']!='jav' and p.suffix.lower().lstrip('.') in SUB)}
+                todo = []
+            except RecursivePathConflict:
+                # Unusual duplicate nested folder names retain the established
+                # stable alias rules from the directory walker.
+                files = {}
         cached = 0
         seen_files = 0
         while todo:
@@ -450,7 +533,7 @@ class Clouds:
         entry['moved'] = moved
         journal('cloud_trash', entry)
 
-    def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
+    def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None, generated=None):
         account = plan['account']
         if config_fingerprint(config) != plan['config_fingerprint'] or self.account(account)['revision'] != plan['account_revision']:
             raise CloudError('设置或网盘账号已变更，请重新预览')
@@ -488,7 +571,10 @@ class Clouds:
                         target = inside(action['target'], [dst])
                         if kind == 'strm':
                             data = (playback({'account': account, 'object': obj}) + '\n').encode()
-                            if target.exists():
+                            if generated:
+                                result[generated.write(target, data, action)] += 1
+                                generated.record(plan, action, data)
+                            elif target.exists():
                                 if target.stat().st_size == len(data) and target.read_bytes() == data:
                                     result['skipped'] += 1
                                 else:

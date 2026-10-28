@@ -104,10 +104,10 @@ class Watcher:
         cancel = lambda: self.stop.is_set() or job_id in state.cancelled
         try:
             plan = state.make_plan(watch['options'], config, cancel, state.scan_progress(job))
-            # Additions only: never move, clean up, rewrite or delete an existing file.
+            # New files and explicitly managed regeneration only; never move or clean up.
             # A recently modified source is retried on the next pass.
             plan['actions'] = [a for a in plan['actions'] if a['type'] in ('strm', 'copy')
-                               and not Path(a['target']).exists()
+                               and (not Path(a['target']).exists() or a.get('managed_hash'))
                                and (a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime) <= time.time() - 60]
             plan['counts'] = {k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash')}
             if plan['actions']:

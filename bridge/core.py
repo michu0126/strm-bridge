@@ -189,7 +189,7 @@ def exclusive_write(target, writer):
     finally:
         temp.unlink(missing_ok=True)
 
-def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
+def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None, generated=None):
     if config_fingerprint(config) != plan['config_fingerprint']:
         raise ValueError('设置已变更，请重新预览')
     if time.time() - plan['created'] > 3600:
@@ -229,7 +229,10 @@ def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda:
                     else:
                         content = playback_url(p)
                     data = (content + '\n').encode('utf-8')
-                    if out.exists():
+                    if generated:
+                        result[generated.write(out, data, a)] += 1
+                        generated.record(plan, a, data)
+                    elif out.exists():
                         if out.stat().st_size == len(data) and out.read_bytes() == data:
                             result['skipped'] += 1
                         else:

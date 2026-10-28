@@ -22,6 +22,7 @@ from .resolver import valid_url, resolve, test_connection
 from .watcher import Watcher
 from .upload_watcher import UploadWatcher
 from .appearance import Wallpapers, MAX_IMAGE
+from .generated import GeneratedRecords
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
 from .cloud_login import CloudLogin
@@ -73,6 +74,7 @@ class State:
                 j.update(status='interrupted', error=message)
                 self.put_job(j)
         self.clouds = Clouds(self)
+        self.generated = GeneratedRecords(self)
         self.dav_cache = webdav.DirectoryCache(self)
         self.cloud_login = CloudLogin()
         self.watcher = Watcher(self)
@@ -141,18 +143,21 @@ class State:
     def sign(self, media_id):
         return hmac.new(self.key.encode(), media_id.encode(), hashlib.sha256).hexdigest()
 
-    def playback(self, p):
+    def playback(self, p, register=True):
         remote = isinstance(p, dict)
         identity = ('cloud:' + p['account'] + ':' + str(p['object'].get('fsid', p['object']['id']))) if remote else str(p)
         stored = 'cloud:' + json.dumps(p, ensure_ascii=False) if remote else str(p)
         media_id = hashlib.sha256(identity.encode()).hexdigest()[:32]
-        with self.lock:
-            self.db.execute('INSERT OR REPLACE INTO media VALUES(?,?)', (media_id, stored))
-            self.db.commit()
+        if register:
+            with self.lock:
+                self.db.execute('INSERT OR REPLACE INTO media VALUES(?,?)', (media_id, stored))
+                self.db.commit()
         return self.config['public_url'].rstrip('/') + '/play/' + media_id + '/' + self.sign(media_id) + '/' + quote(p['object']['name'] if remote else p.name, safe='')
 
     def make_plan(self, options, config, cancel=lambda: False, progress=lambda info: None):
-        return self.clouds.plan(options, config, cancel, progress) if is_cloud(options['source']) else make_plan(options, config, cancel, progress)
+        self.generated.backfill(cancel)
+        plan = self.clouds.plan(options, config, cancel, progress) if is_cloud(options['source']) else make_plan(options, config, cancel, progress)
+        return self.generated.filter(plan, config)
 
     def scan_progress(self, job):
         def update(info):
@@ -162,9 +167,12 @@ class State:
 
     def execute(self, plan, config, playback, progress=lambda *a: None, cancel=lambda: False, journal=lambda *a: None):
         runner = self.clouds.execute if 'account' in plan else execute
-        return runner(plan, config, playback, progress, cancel, journal)
+        try:
+            return runner(plan, config, playback, progress, cancel, journal, generated=self.generated)
+        finally:
+            self.generated.flush()
 
-    def start_scan(self, options):
+    def start_scan(self, options, regenerate=None):
         with self.lock:
             if self.busy:
                 raise ValueError('已有任务正在运行，请等待或取消')
@@ -175,8 +183,14 @@ class State:
         self.put_job(job)
         def work():
             try:
-                plan = self.make_plan(options, config, lambda: job_id in self.cancelled, self.scan_progress(job))
+                plan = (self.generated.single_plan(regenerate, config) if regenerate else
+                        self.make_plan(options, config, lambda: job_id in self.cancelled, self.scan_progress(job)))
                 job.update(status='preview', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
+                if regenerate:
+                    job['status'] = 'running'
+                    self.put_job(job)
+                    result = self.execute(plan, config, self.playback, ExecutionProgress(self, job), lambda: job_id in self.cancelled)
+                    job.update(status='cancelled' if result['cancelled'] else ('partial' if result['errors'] else 'completed'), result=result)
             except Exception as e:
                 job.update(status='cancelled' if job_id in self.cancelled else 'failed', error=str(e))
             finally:
@@ -367,7 +381,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(data, content_type=mime)
             if path == '/api/browse':
                 kind = query.get('kind', ['source'])[0]
-                roots = self.state.uploads.roots() if kind == 'upload_source' else self.state.config['source_roots' if kind == 'source' else 'target_roots']
+                if kind not in ('source', 'target', 'upload_source', 'upload_files', 'upload_target'):
+                    raise ValueError('目录选择类型无效')
+                roots = self.state.uploads.roots() if kind in ('upload_source', 'upload_files') else self.state.config['source_roots' if kind == 'source' else 'target_roots']
                 requested = query.get('path', [''])[0]
                 if kind in ('source', 'upload_target') and is_cloud(requested):
                     if kind == 'upload_target':
@@ -389,14 +405,31 @@ class Handler(BaseHTTPRequestHandler):
                 p = inside(requested, roots)
                 if not p.is_dir():
                     raise ValueError('目录不存在或挂载未就绪')
+                if kind == 'upload_files':
+                    offset = max(0, int(query.get('offset', ['0'])[0]))
+                    with os.scandir(p) as iterator:
+                        entries = sorted((e for e in iterator if not e.is_symlink() and e.name not in SKIP_DIRS
+                                          and (e.is_dir(follow_symlinks=False) or e.is_file(follow_symlinks=False))),
+                                         key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.casefold()))
+                    rows = [{'name': e.name, 'path': str(p / e.name), 'folder': e.is_dir(follow_symlinks=False),
+                             'size': 0 if e.is_dir(follow_symlinks=False) else e.stat(follow_symlinks=False).st_size}
+                            for e in entries[offset:offset + 200]]
+                    return self.respond({'roots': roots, 'path': str(p), 'parent': str(p.parent) if str(p) not in roots else '',
+                                         'entries': rows, 'offset': offset, 'total': len(entries), 'more': offset + 200 < len(entries)})
                 directories = [{'name': x.name, 'path': str(x)} for x in p.iterdir() if x.is_dir() and not x.is_symlink() and x.name not in SKIP_DIRS]
                 return self.respond({'roots': roots, 'path': str(p), 'parent': str(p.parent) if str(p) not in roots else '', 'directories': sorted(directories, key=lambda d: d['name'].casefold())})
+            if path == '/api/generated':
+                return self.respond(self.state.generated.list(query.get('offset',['0'])[0],query.get('search',[''])[0]))
             if path == '/api/jobs':
                 return self.respond(self.state.jobs())
             if path == '/api/watches':
                 return self.respond(self.state.watcher.list())
             if path == '/api/uploads':
-                return self.respond(self.state.uploads.list())
+                return self.respond(self.state.uploads.list('watch'))
+            if path == '/api/uploads/manual':
+                return self.respond(self.state.uploads.list('manual', 50))
+            if path.startswith('/api/uploads/staging/'):
+                return self.respond(self.state.uploads.browser_task(path.rsplit('/', 1)[-1]))
             if path.startswith('/api/jobs/'):
                 offset = max(0, int(query.get('offset', ['0'])[0]))
                 job_id = path.rsplit('/', 1)[-1]
@@ -404,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'logo.svg'):
+        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'generated.js', 'logo.svg'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
@@ -434,6 +467,22 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < size <= MAX_IMAGE:
                 return self.respond({'error': '背景图片需要在 10MB 以内'}, 413)
             return self.respond(self.state.wallpapers.upload(self.rfile.read(size)))
+        if self.path.startswith('/api/uploads/staging/') and self.path.endswith('/chunk'):
+            if not self.authorized():
+                return self.respond({'error': '请登录'}, 401)
+            if self.headers.get('Content-Type', '').split(';')[0] != 'application/octet-stream':
+                return self.respond({'error': '需要文件数据'}, 415)
+            identifier = self.path.split('/')[4]
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 8 * 1024 * 1024:
+                self.close_connection = True
+                return self.respond({'error': '每次传输数据需要在 8MB 以内'}, 413)
+            try:
+                return self.respond(self.state.uploads.browser_chunk(identifier,
+                    int(self.headers.get('X-Upload-Index', '-1')), int(self.headers.get('X-Upload-Offset', '-1')), length, self.rfile))
+            except Exception:
+                self.close_connection = True
+                raise
         if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
             return self.respond({'error': '需要 JSON 请求'}, 415)
         length = int(self.headers.get('Content-Length', '0'))
@@ -458,6 +507,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond({'error': '请登录'}, 401)
         if self.path == '/api/logout':
             return self.respond({'ok': True}, headers={'Set-Cookie': 'session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict'})
+        if self.path == '/api/generated/delete':
+            return self.respond(self.state.generated.delete(data.get('ids')))
+        if self.path == '/api/generated/regenerate':
+            record = self.state.generated.get(data['id'])
+            return self.respond(self.state.start_scan(record['options'], regenerate=data['id']), 202)
         if self.path == '/api/scan':
             return self.respond(self.state.start_scan(data), 202)
         if self.path == '/api/clouds/login/start':
@@ -476,6 +530,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(self.state.watcher.save(data))
         if self.path == '/api/uploads':
             return self.respond(self.state.uploads.save(data))
+        if self.path == '/api/uploads/manual':
+            return self.respond(self.state.uploads.manual(data), 202)
+        if self.path == '/api/uploads/staging':
+            return self.respond(self.state.uploads.browser_begin(data), 202)
+        if self.path.startswith('/api/uploads/staging/') and self.path.endswith('/finish'):
+            return self.respond(self.state.uploads.browser_finish(self.path.split('/')[4]), 202)
+        if self.path in ('/api/uploads/manual/pause', '/api/uploads/manual/resume', '/api/uploads/manual/retry', '/api/uploads/manual/delete'):
+            return self.respond(self.state.uploads.manual_control(data['id'], self.path.rsplit('/', 1)[-1]))
         if self.path in ('/api/uploads/check', '/api/uploads/retry', '/api/uploads/delete'):
             return self.respond(self.state.uploads.control(data['id'],
                 retry=self.path.endswith('/retry'), delete=self.path.endswith('/delete')))

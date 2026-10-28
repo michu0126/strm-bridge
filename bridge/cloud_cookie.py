@@ -64,6 +64,40 @@ class Cookie115(Provider):
             if not rows:
                 raise CloudError('115 目录未读取完整，请重试')
 
+    def recursive_pages(self, parent):
+        """115 cur=0 lists every file below a directory in a few pages."""
+        offset, seen, count = 0, set(), None
+        while True:
+            d = self.request('/files', query={'aid':1,'cid':parent,'cur':0,'show_dir':0,
+                'count_folders':0,'limit':1000,'offset':offset,'o':'user_ptime','asc':1})
+            if 'count' not in d or not isinstance(d.get('data'),list):
+                raise CloudError('115 批量列表不完整，请重试')
+            current_count = int(d['count'])
+            if count is not None and current_count != count:
+                raise CloudError('扫描期间网盘内容发生变化，请重新扫描')
+            count = current_count
+            rows = []
+            for r in d['data']:
+                identifier = str(r.get('fid',''))
+                if not identifier or identifier in seen or 'cid' not in r:
+                    raise CloudError('115 批量列表重复或不完整，请重新扫描')
+                seen.add(identifier)
+                rows.append(dict(item(identifier,r['n'],False,r.get('s'),r.get('te',r.get('t',0)),
+                    pickcode=r.get('pc',''),sha1=r.get('sha','')),parent=str(r['cid'])))
+            offset += len(rows)
+            if offset > count or (not rows and offset < count):
+                raise CloudError('115 批量列表数量不一致，请重新扫描')
+            yield rows
+            if offset == count:
+                return
+
+    def directory_path(self, parent):
+        d = self.request('/files',query={'aid':1,'cid':parent,'cur':1,'show_dir':1,'limit':1,'offset':0})
+        path = d.get('path')
+        if not isinstance(path,list) or not path or str(path[-1].get('cid')) != str(parent):
+            raise CloudError('115 文件夹路径不完整，请重试')
+        return [{'id':str(p['cid']),'name':p['name'],'parent':str(p.get('pid','0'))} for p in path]
+
     def link(self, obj, agent):
         key = secrets.token_bytes(16)
         payload = cipher115.encode(json.dumps({'pickcode': obj['pickcode']}, separators=(',', ':')).encode(), key)
