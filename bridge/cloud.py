@@ -476,14 +476,14 @@ class Clouds:
                     raise CloudError('字幕文件名冲突')
                 used.add(out)
                 actions.append(action(options.get('subtitle_mode', 'copy'), p, out))
-        actions.extend(action('trash', p) for p in trash)
+        actions.extend(action('delete', p) for p in trash)
         with self.state.lock:
             self.state.db.execute('DELETE FROM scan_directories WHERE scan=? OR checked<?', (key, time.time() - 86400))
             self.state.db.commit()
         report.update(force=True, phase='ready', current='', pending=0)
         return {'id': uuid.uuid4().hex, 'created': time.time(), 'account': account, 'account_revision': revision,
                 'options': dict(options, target=str(dst), mode='redirect'), 'actions': actions, 'warnings': warnings,
-                'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
+                'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash', 'delete')},
                 'config_fingerprint': config_fingerprint(config)}
 
     def download(self, client, obj, target, cancel):
@@ -541,9 +541,11 @@ class Clouds:
             raise CloudError('设置或网盘账号已变更，请重新预览')
         if time.time() - plan['created'] > 3600:
             raise CloudError('预览已过期，请重新扫描')
+        if any(a['type']=='trash' for a in plan['actions']):
+            raise CloudError('小文件清理规则已更新，请重新扫描并确认删除清单')
         _, root = parse_uri(plan['options']['source'])
         dst = inside(plan['options']['target'], config['target_roots'])
-        result = {'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'errors': [], 'cancelled': False}
+        result = {'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'deleted': 0, 'errors': [], 'cancelled': False}
         checked = OrderedDict()
         for i, action in enumerate(plan['actions']):
             if cancel():
@@ -555,13 +557,25 @@ class Clouds:
                     if self.account(account)['revision'] != plan['account_revision']:
                         raise CloudError('网盘账号已变更，请重新扫描')
                     kind = action['type']
-                    if kind == 'trash':
+                    if kind == 'delete':
                         if result['errors']:
                             raise CloudError('生成发生错误，本次清理已停止')
                         if plan['options']['kind'] != 'jav' or not plan['options'].get('cleanup') or obj['size'] >= CLEANUP_LIMIT:
                             raise CloudError('不允许清理此文件')
-                        self.quarantine(account, client, obj, root, plan['id'], journal)
-                        result['trashed'] += 1
+                        rows=self.entries(account,obj['parent'],client,cancel,allow_duplicates=True)
+                        current=next((r for r in rows if r['id']==obj['id']),None)
+                        if current is None or current['folder'] or current['name']!=obj['name'] or signature(current)!=action['signature']:
+                            raise CloudError('云端文件已变更，请重新扫描')
+                        if obj.get('sha1') and current.get('sha1','').upper()!=obj['sha1'].upper():
+                            raise CloudError('云端文件内容已变更，请重新扫描')
+                        journal('cloud_pending_delete',{'account':account,'original':current})
+                        client.delete(current)
+                        for attempt in range(10):
+                            if not any(r['id']==obj['id'] for r in self.entries(account,obj['parent'],client,allow_duplicates=True)):break
+                            if attempt==9:raise CloudError('未确认删除结果，请检查网盘目录')
+                            time.sleep(1)
+                        journal('cloud_deleted',{'account':account,'original':current})
+                        result['deleted'] += 1
                     else:
                         if obj['parent'] not in checked:
                             if len(checked) >= 32:

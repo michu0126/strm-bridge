@@ -72,7 +72,7 @@ class GeneratedRecords:
                 action['managed_hash'] = managed['content_hash']
             actions.append(action)
         plan['actions'] = actions
-        plan['counts'] = {k:sum(a['type']==k for a in actions) for k in ('strm','copy','move','trash')}
+        plan['counts'] = {k:sum(a['type']==k for a in actions) for k in ('strm','copy','move','trash','delete')}
         plan['counts']['recorded'] = skipped
         return plan
 

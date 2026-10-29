@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 
-from .core import inside, make_plan, execute, media_extensions
+from .core import inside, make_plan, execute, media_extensions, config_fingerprint
 from .cloud import is_cloud, parse_uri
 from .progress import ExecutionProgress
 
@@ -30,6 +30,17 @@ class Watcher:
             self.state.db.execute('INSERT OR REPLACE INTO watches VALUES(?,?)', (watch['id'], json.dumps(watch, ensure_ascii=False)))
             self.state.db.commit()
 
+    def confirm_cleanup(self, options, preview_id):
+        if options.get('kind')!='jav':raise ValueError('仅 JAV 监控支持小文件删除')
+        if not preview_id:raise ValueError('请先预览删除清单，再确认开启自动删除')
+        job=self.state.job(preview_id);plan=job.get('plan',{});old=plan.get('options',{})
+        if job['status']!='preview' or not old.get('cleanup') or any(a['type']=='trash' for a in plan.get('actions',[])) or time.time()-plan.get('created',0)>3600:
+            raise ValueError('删除预览已失效，请重新预览')
+        if any(old.get(k,'')!=options.get(k,'') for k in ('source','target','kind','mode','extra_extensions')) or plan.get('config_fingerprint')!=config_fingerprint(self.state.config):
+            raise ValueError('监控目录或设置已改变，请重新预览删除清单')
+        if 'account' in plan and self.state.clouds.account(plan['account'])['revision']!=plan['account_revision']:
+            raise ValueError('网盘授权已改变，请重新预览')
+
     def save(self, data):
         state = self.state
         with state.lock:
@@ -47,6 +58,13 @@ class Watcher:
                     if options['reconcile']:
                         state.reconciler.validate(options, live=False)
                     watch['options'] = options
+                if 'cleanup' in data:
+                    options=dict(watch['options'],cleanup=data['cleanup'] is True)
+                    if options['cleanup'] and not watch['options'].get('cleanup'):
+                        self.confirm_cleanup(options,data.get('cleanup_preview'))
+                    elif not options['cleanup'] and watch['options'].get('cleanup') and self.active_id==watch['id'] and state.busy:
+                        state.cancelled.add(state.busy)
+                    watch['options']=options
                 watch['next_run'] = time.time()
                 if not watch['enabled'] and self.active_id == watch['id'] and state.busy:
                     state.cancelled.add(state.busy)
@@ -70,7 +88,8 @@ class Watcher:
                 interval = int(data.get('interval', 300))
                 if not 60 <= interval <= 86400:
                     raise ValueError('检查间隔需为 1 分钟至 24 小时')
-                options.update(source=str(source), target=str(target), cleanup=False, subtitle_mode='copy')
+                options.update(source=str(source), target=str(target), cleanup=options.get('cleanup') is True, subtitle_mode='copy')
+                if options['cleanup']:self.confirm_cleanup(options,data.get('cleanup_preview'))
                 if options.get('reconcile'):
                     state.reconciler.validate(options, live=False)
                 if any(w['options']['source'] == str(source) and w['options']['target'] == str(target) for w in self.list()):
@@ -117,10 +136,11 @@ class Watcher:
             plan = state.make_plan(watch['options'], config, cancel, state.scan_progress(job))
             # New files and explicitly managed regeneration only; never move or clean up.
             # A recently modified source is retried on the next pass.
-            plan['actions'] = [a for a in plan['actions'] if a['type']=='retire' or (a['type'] in ('strm', 'copy')
+            plan['actions'] = [a for a in plan['actions'] if a['type']=='retire' or (a['type']=='delete' and
+                               0<(a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime)<=time.time()-60) or (a['type'] in ('strm', 'copy')
                                and (not Path(a['target']).exists() or a.get('managed_hash'))
                                and (plan['options'].get('reconcile') or (a['remote']['modified'] if 'remote' in a else Path(a['source']).stat().st_mtime) <= time.time() - 60))]
-            plan['counts'].update({k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash', 'retire')})
+            plan['counts'].update({k: sum(a['type'] == k for a in plan['actions']) for k in ('strm', 'copy', 'move', 'trash', 'delete', 'retire')})
             if plan['actions']:
                 job.update(status='running', plan=plan, counts=plan['counts'], warnings=plan['warnings'])
                 state.put_job(job)

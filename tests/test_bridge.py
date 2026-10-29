@@ -49,12 +49,12 @@ class CoreTests(unittest.TestCase):
         plan, r = self.run_plan(kind='jav', cleanup=True, extra_extensions='weirdfmt')
         self.assertTrue(video.exists())
         self.assertEqual(r['created'], 1)
-        self.assertEqual(r['trashed'], len(junk))
+        self.assertEqual(r['deleted'], len(junk))
         self.assertEqual(r['errors'], [])
         self.assertEqual({a['source'] for a in plan['actions'] if a['type'] == 'strm'}, {str(video.resolve())})
         for p in junk:
             self.assertFalse(p.exists())
-            self.assertTrue((self.src / '.strm-trash' / plan['id'] / p.name).exists())
+            self.assertFalse((self.src / '.strm-trash').exists())
 
     def test_folder_with_only_small_videos_can_be_cleaned(self):
         video = self.file('ad.mp4')
@@ -62,12 +62,12 @@ class CoreTests(unittest.TestCase):
         plan, r = self.run_plan(kind='jav', cleanup=True)
         self.assertFalse(video.exists()); self.assertFalse(junk.exists())
         self.assertEqual(r['created'], 0)
-        self.assertEqual(r['trashed'], 2)
-        self.assertTrue((self.src / '.strm-trash' / plan['id'] / junk.name).exists())
+        self.assertEqual(r['deleted'], 2)
+        self.assertFalse((self.src / '.strm-trash').exists())
     def test_cleanup_default_off(self):
         video = self.file('movie.mp4'); junk = self.file('other.txt')
         _, r = self.run_plan(kind='jav')
-        self.assertEqual(r['trashed'], 0); self.assertTrue(junk.exists())
+        self.assertEqual(r['deleted'], 0); self.assertTrue(junk.exists())
         self.assertTrue(video.exists()); self.assertEqual(r['created'], 1)
     def test_cleanup_forbidden_for_movies(self):
         with self.assertRaises(ValueError):
@@ -77,12 +77,12 @@ class CoreTests(unittest.TestCase):
         big = self.file('large.bin', size=100_000_000)
         small = self.file('ad.mp4', size=99_999_999)
         p, r = self.run_plan(kind='jav', cleanup=True)
-        self.assertEqual(r['trashed'], 1); self.assertTrue(big.exists()); self.assertTrue(video.exists())
+        self.assertEqual(r['deleted'], 1); self.assertTrue(big.exists()); self.assertTrue(video.exists())
         self.assertFalse(small.exists()); self.assertEqual(r['created'], 1)
     def test_cleanup_does_not_touch_unrelated_directories(self):
         self.file('one/movie.mp4', size=100_000_000); other = self.file('two/document.txt')
         _, r = self.run_plan(kind='jav', cleanup=True)
-        self.assertTrue(other.exists()); self.assertEqual(r['trashed'], 0)
+        self.assertTrue(other.exists()); self.assertEqual(r['deleted'], 0)
     def test_named_subtitle_preserves_language(self):
         self.file('film.mkv'); self.file('film.zh-CN.forced.ASS')
         _, r = self.run_plan()
@@ -138,7 +138,7 @@ class CoreTests(unittest.TestCase):
         small_video = self.file('ad.mp4')
         (self.dst / 'movie.strm').write_text('existing')
         _, r = self.run_plan(kind='jav', cleanup=True)
-        self.assertTrue(junk.exists()); self.assertEqual(r['trashed'], 0)
+        self.assertTrue(junk.exists()); self.assertEqual(r['deleted'], 0)
         self.assertTrue(small_video.exists())
 
     def test_small_video_changed_after_preview_is_not_cleaned(self):
@@ -149,7 +149,7 @@ class CoreTests(unittest.TestCase):
         os.utime(video, ns=(modified, modified))
         result = execute(plan, self.config, lambda p: 'unused')
         self.assertTrue(video.exists())
-        self.assertEqual(result['trashed'], 0)
+        self.assertEqual(result['deleted'], 0)
         self.assertTrue(result['errors'])
     def test_reject_nested_source_and_target(self):
         self.config['target_roots'] = [str(self.src)]
@@ -397,7 +397,8 @@ class ServerTests(unittest.TestCase):
         (src/'other.txt').write_bytes(b'old')
         p=make_plan({'source':str(src),'target':str(dst),'kind':'jav','cleanup':True},self.state.config)
         self.state.put_job({'id':'j1','status':'running','plan':p})
-        execute(p,self.state.config,self.state.playback,journal=lambda k,v:self.state.journal('j1',k,v))
+        trash=src/'.strm-trash'/p['id']/'other.txt';trash.parent.mkdir(parents=True);(src/'other.txt').rename(trash)
+        self.state.journal('j1','trash',{'source':str(src/'other.txt'),'trash':str(trash)})
         (src/'other.txt').write_bytes(b'new')
         r=self.state.restore('j1');self.assertEqual(r['restored'],0);self.assertTrue(r['errors'])
         (src/'other.txt').unlink()

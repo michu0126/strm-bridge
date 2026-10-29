@@ -239,3 +239,6 @@ class Web123(Provider):
     def move(self, obj, destination):
         self.request('/file/mod_pid', 'POST', body={'fileIdList': [{'FileId': obj['id']}], 'parentFileId': destination})
         return dict(obj, parent=destination)
+
+    def delete(self, obj):
+        self.request('/file/trash', 'POST', body={'driveId':0,'operation':True,'fileTrashInfoList':[{'FileId':int(obj['id'])}]})

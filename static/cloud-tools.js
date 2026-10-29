@@ -13,7 +13,7 @@
   let scans=[],current=null,batch=null,offset=0,total=0,rows=[],request=0;
   const selected=new Set();let movePreview=null;
   const states={scanning:'检测中',running:'操作中',completed:'完成',partial:'部分完成',cancelled:'已暂停',interrupted:'等待继续',failed:'失败'};
-  function selection(){const running=current?.status==='scanning'||batch?.status==='running';$('videoSelectedCount').textContent=`已选 ${selected.size} 个低清影片`;$('moveSelectedVideos').disabled=!selected.size||running;$('deleteSelectedVideos').disabled=!selected.size||running;}
+  function selection(){const running=current?.status==='scanning'||batch?.status==='running';$('videoBatchActions').classList.toggle('hidden',!selected.size);$('videoSelectedCount').textContent=`已选 ${selected.size} 个低清影片`;$('moveSelectedVideos').disabled=!selected.size||running;$('deleteSelectedVideos').disabled=!selected.size||running;}
   async function refresh(){
     const ticket=++request;const all=await api('/api/videos/scans');if(ticket!==request)return;
     scans=all.filter(s=>!s.operation);batch=all.find(s=>s.operation)||null;
@@ -39,7 +39,7 @@
     $('videoPage').textContent=`${Math.floor(offset/100)+1} / ${Math.max(1,Math.ceil(total/100))} · ${total} 个`;$('videoPrev').disabled=offset===0;$('videoNext').disabled=offset+100>=total;
     const active=all.find(s=>['scanning','running'].includes(s.status));$('cancelVideoTask').disabled=!active;
     if(batch){const r=batch.result||{};$('videoTaskResult').textContent=`最近批量操作：${states[batch.status]||batch.status} · ${batch.done} / ${batch.total} · 移动 ${r.moved||0} ${batch.move_scope==='folder'?`个文件夹（选中影片 ${r.moved_videos||0} 部）`:'个视频（旧版记录）'} · 删除 ${r.deleted||0} 个视频`+(r.errors?.length?' · '+r.errors.slice(0,3).map(x=>x.path+'：'+x.message).join('；'):'')+(batch.error?' · '+batch.error:'');}
-    selection();
+    if(current&&current.status!=='scanning')$('videoFormStatus').textContent='';selection();
   }
   window.loadVideoTools=refresh;
   $('browseVideoSource').addEventListener('click',safe(()=>openFolder('cloud_source',$('videoSource'))));

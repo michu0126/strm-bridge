@@ -37,7 +37,7 @@ $('uploadWatchForm').addEventListener('submit',safe(async e=>{
   finally{submit.disabled=false;}
 }));
 $('refreshUploads').addEventListener('click',safe(()=>window.loadUploadWatches()));
-setInterval(()=>{if(!$('watch').classList.contains('hidden'))window.loadUploadWatches().catch(()=>{});},5000);
+setInterval(()=>{if(!$('uploads').classList.contains('hidden')&&!$('uploadAutomatic').classList.contains('hidden'))window.loadUploadWatches().catch(()=>{});},5000);
 window.renderUploadHistory=function(j){
   const card=textElement('article','','card history-card');const head=textElement('div','','history-head');head.append(textElement('b',(j.upload_mode==='manual'?'手动上传到 115 · ':'上传监控 · ')+new Date(j.created*1000).toLocaleString('zh-CN')),textElement('span',j.status==='running'?'上传中':statuses[j.status]||j.status,'history-status'));card.append(head,textElement('p',j.options.source+' → '+j.options.target),textElement('small',uploadSummary(j.result,j.upload_mode==='manual')));
   if(j.error)card.append(textElement('div',j.error,'errorbox'));for(const e of j.result?.errors||[])card.append(textElement('p',e.path+'：'+e.message));$('historyList').append(card);

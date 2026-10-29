@@ -167,10 +167,10 @@ def make_plan(options, config, cancel=lambda: False, progress=lambda info: None)
             used.add(out)
             actions.append({'type': options.get('subtitle_mode', 'copy'), 'source': str(p), 'target': str(out), 'signature': signature(p)})
     for p in cleanup_files:
-        actions.append({'type': 'trash', 'source': str(p), 'signature': signature(p)})
+        actions.append({'type': 'delete', 'source': str(p), 'signature': signature(p)})
     report.update(force=True, phase='ready', current='')
     return {'id': uuid.uuid4().hex, 'created': time.time(), 'options': dict(options, source=str(src), target=str(dst), mode=mode),
-            'actions': actions, 'warnings': warnings, 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash')},
+            'actions': actions, 'warnings': warnings, 'counts': {k: sum(a['type'] == k for a in actions) for k in ('strm', 'copy', 'move', 'trash', 'delete')},
             'config_fingerprint': config_fingerprint(config)}
 
 def config_fingerprint(config):
@@ -194,9 +194,11 @@ def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda:
         raise ValueError('设置已变更，请重新预览')
     if time.time() - plan['created'] > 3600:
         raise ValueError('预览超过一小时，请重新扫描')
+    if any(a['type']=='trash' for a in plan['actions']):
+        raise ValueError('小文件清理规则已更新，请重新扫描并确认删除清单')
     src = inside(plan['options']['source'], config['source_roots'])
     dst = inside(plan['options']['target'], config['target_roots'])
-    result = {'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'errors': [], 'cancelled': False}
+    result = {'created': 0, 'skipped': 0, 'subtitles': 0, 'trashed': 0, 'deleted': 0, 'errors': [], 'cancelled': False}
     failed = False
     for i, a in enumerate(plan['actions']):
         if cancel():
@@ -206,21 +208,17 @@ def execute(plan, config, playback_url, progress=lambda *a: None, cancel=lambda:
         try:
             if signature(p) != a['signature']:
                 raise ValueError('源文件已变更，请重新预览')
-            if a['type'] == 'trash':
+            if a['type'] == 'delete':
                 if failed:
                     raise ValueError('生成发生错误，本次清理已停止')
                 if plan['options']['kind'] != 'jav' or not plan['options'].get('cleanup'):
                     raise ValueError('不允许清理')
                 if p.stat().st_size >= CLEANUP_LIMIT:
                     raise ValueError('受保护文件')
-                trash = inside(src / '.strm-trash' / plan['id'] / p.relative_to(src), [src])
-                trash.parent.mkdir(parents=True, exist_ok=True)
-                journal('pending_trash', {'source': str(p), 'trash': str(trash)})
-                if trash.exists():
-                    raise ValueError('回收站文件已存在')
-                p.rename(trash)
-                journal('trash', {'source': str(p), 'trash': str(trash)})
-                result['trashed'] += 1
+                journal('pending_delete', {'source': str(p), 'signature': a['signature']})
+                p.unlink()
+                journal('deleted', {'source': str(p)})
+                result['deleted'] += 1
             else:
                 out = inside(a['target'], [dst])
                 if a['type'] == 'strm':

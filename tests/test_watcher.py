@@ -76,12 +76,51 @@ class WatchTests(unittest.TestCase):
 
     def test_auto_watch_never_cleans_or_moves_source_files(self):
         self.file('movie.mkv'); sub = self.file('movie.srt'); junk = self.file('other.url')
-        options = dict(self.options, kind='jav', cleanup=True, subtitle_mode='move')
+        options = dict(self.options, kind='jav', cleanup=False, subtitle_mode='move')
         watch = self.state.watcher.save({'options': options})
         self.assertFalse(watch['options']['cleanup'])
         self.assertEqual(watch['options']['subtitle_mode'], 'copy')
         self.run_watch()
         self.assertTrue(sub.exists()); self.assertTrue(junk.exists())
+
+    def cleanup_preview(self, options):
+        import uuid
+        plan=self.state.make_plan(options,self.state.config);identifier=uuid.uuid4().hex
+        self.state.put_job({'id':identifier,'status':'preview','plan':plan,'options':options})
+        return identifier
+
+    def test_cleanup_opt_in_requires_matching_preview_and_keeps_recent_files(self):
+        main=self.file('movie.mkv')
+        with main.open('r+b') as f:f.truncate(100_000_000)
+        os.utime(main,(time.time()-120,time.time()-120))
+        old=self.file('ad.url');recent=self.file('new.mp4',recent=True)
+        options=dict(self.options,kind='jav',cleanup=True)
+        with self.assertRaisesRegex(ValueError,'预览'):self.state.watcher.save({'options':options})
+        preview=self.cleanup_preview(options)
+        watch=self.state.watcher.save({'options':options,'cleanup_preview':preview})
+        self.assertTrue(watch['options']['cleanup']);self.run_watch()
+        self.assertFalse(old.exists());self.assertTrue(recent.exists());self.assertTrue(main.exists());self.assertFalse((self.source/'.strm-trash').exists())
+        os.utime(recent,(time.time()-120,time.time()-120));self.run_watch();self.assertFalse(recent.exists())
+        self.assertTrue((self.target/'movie.strm').exists())
+        self.assertEqual(self.state.watcher.list()[0]['last_result']['deleted'],1)
+
+    def test_existing_watch_cleanup_toggle_requires_preview_only_when_enabled(self):
+        options=dict(self.options,kind='jav');watch=self.state.watcher.save({'options':options})
+        with self.assertRaisesRegex(ValueError,'预览'):self.state.watcher.save({'id':watch['id'],'cleanup':True})
+        preview=self.cleanup_preview(dict(options,cleanup=True))
+        self.state.watcher.save({'id':watch['id'],'cleanup':True,'cleanup_preview':preview})
+        self.state.watcher.save({'id':watch['id'],'enabled':False})
+        self.assertTrue(self.state.watcher.list()[0]['options']['cleanup'])
+        self.state.watcher.save({'id':watch['id'],'cleanup':False})
+        self.assertFalse(self.state.watcher.list()[0]['options']['cleanup'])
+
+    def test_cleanup_wrong_directory_or_expired_preview_is_rejected(self):
+        self.state.config['target_roots']=[str(self.root)]
+        options=dict(self.options,kind='jav',cleanup=True);preview=self.cleanup_preview(options)
+        other=self.root/'other';other.mkdir()
+        with self.assertRaisesRegex(ValueError,'改变'):self.state.watcher.save({'options':dict(options,target=str(other)),'cleanup_preview':preview})
+        with patch('bridge.watcher.time.time',return_value=time.time()+3601):
+            with self.assertRaisesRegex(ValueError,'失效'):self.state.watcher.save({'options':options,'cleanup_preview':preview})
 
     def test_busy_service_skips_and_paused_watch_stays_paused(self):
         watch = self.state.watcher.save({'options': self.options})

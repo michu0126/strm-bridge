@@ -140,6 +140,9 @@ class Provider:
     def move(self, obj, destination):
         raise NotImplementedError
 
+    def delete(self, obj):
+        raise CloudError('当前网盘接口不支持直接删除')
+
 
 class Cloud115(Provider):
     base = 'https://proapi.115.com'
@@ -181,6 +184,9 @@ class Cloud115(Provider):
     def move(self, obj, destination):
         self.request('/open/ufile/move', 'POST', form={'file_ids': obj['id'], 'to_cid': destination})
         return dict(obj, parent=destination)
+
+    def delete(self, obj):
+        self.request('/open/ufile/delete', 'POST', form={'file_ids':obj['id'], 'parent_id':obj['parent']})
 
 
 class Cloud123(Provider):
@@ -224,6 +230,9 @@ class Cloud123(Provider):
     def move(self, obj, destination):
         self.request('/api/v1/file/move', 'POST', body={'fileIDs': [int(obj['id'])], 'toParentFileID': int(destination)})
         return dict(obj, parent=destination)
+
+    def delete(self, obj):
+        self.request('/api/v1/file/trash', 'POST', body={'fileIDs':[int(obj['id'])]})
 
 
 class Aliyun(Provider):
@@ -272,6 +281,10 @@ class Aliyun(Provider):
         if d.get('async_task_id'):
             raise CloudError('网盘移动仍在异步处理中，请稍后在任务记录恢复或检查云盘')
         return dict(obj, id=d.get('file_id', obj['id']), parent=destination)
+
+
+    def delete(self, obj):
+        self.request('/adrive/v1.0/openFile/recyclebin/trash', 'POST', body={'drive_id':self.drive(), 'file_id':obj['id']})
 
 
 class Baidu(Provider):
@@ -333,6 +346,12 @@ class Baidu(Provider):
         return dict(obj, id=destination.rstrip('/') + '/' + obj['name'], parent=destination)
 
 
+    def delete(self, obj):
+        d=self.request('/xpan/file', 'POST', query={'method':'filemanager','opera':'delete'}, form={'async':'0','filelist':json.dumps([obj['id']]),'ondup':'fail'})
+        if any(r.get('errno',0) for r in d.get('info',[])) or d.get('taskid'):
+            raise CloudError('百度网盘删除未确认完成，请检查云端文件')
+
+
 class Tianyi(Provider):
     base = 'https://cloud.189.cn'
     root = '-11'
@@ -379,6 +398,11 @@ class Tianyi(Provider):
                 return dict(matches[0], parent=destination)
             time.sleep(1)
         raise CloudError('天翼云盘移动仍在处理中，请稍后检查任务记录')
+
+
+    def delete(self, obj):
+        self.request('/api/open/batch/createBatchTask.action', 'POST', form={'type':'DELETE','targetFolderId':'',
+            'taskInfos':json.dumps([{'fileId':obj['id'],'fileName':obj['name'],'isFolder':int(obj['folder'])}])})
 
 
 def online_refresh(client, provider):

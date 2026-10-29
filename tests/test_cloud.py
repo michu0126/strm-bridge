@@ -17,6 +17,7 @@ class FakeCloud:
         self.tree = {'0': [item('dir', '电影', True)], 'dir': []}
         self.links = []
         self.moves = []
+        self.deletes = []
     def add(self, name, size=120_000_000, parent='dir', identifier=None):
         obj = item(identifier or str(sum(map(len, self.tree.values())) + 100), name, False, size, time.time()-120)
         self.tree[parent].append(obj)
@@ -34,6 +35,9 @@ class FakeCloud:
         self.tree[destination].append(moved)
         self.moves.append((obj['id'], destination))
         return moved
+    def delete(self, obj):
+        self.tree[obj['parent']] = [r for r in self.tree[obj['parent']] if r['id'] != obj['id']]
+        self.deletes.append(obj['id'])
     def link(self, obj, agent):
         self.links.append(obj['id'])
         return 'https://media.example/' + obj['id'], {}
@@ -75,34 +79,35 @@ class NativeCloudTests(unittest.TestCase):
         self.assertEqual(self.run_plan(plan)['skipped'], 1)
         row = self.state.db.execute('SELECT path FROM media').fetchone()[0]
         self.assertEqual(self.state.clouds.resolve(json.loads(row[6:]), 'player'), 'https://media.example/101')
-    def test_all_small_types_including_videos_are_quarantined_and_restorable(self):
+    def test_all_small_types_are_deleted_without_creating_quarantine(self):
         self.fake.add('main.mkv', 100_000_000)
         small = ['advert.mp4', 'advert.exe', 'README', 'ad.rar', 'ad.strm', 'ad.srt']
         for name in small: self.fake.add(name, 12)
         plan = self.plan(kind='jav', cleanup=True)
-        self.assertEqual(plan['counts']['strm'], 1); self.assertEqual(plan['counts']['trash'], 6)
+        self.assertEqual(plan['counts']['strm'], 1); self.assertEqual(plan['counts']['delete'], 6)
         result = self.run_plan(plan)
-        self.assertEqual(result['errors'], []); self.assertEqual(result['trashed'], 6)
+        self.assertEqual(result['errors'], []); self.assertEqual(result['deleted'], 6)
+        self.assertEqual(set(self.fake.tree),{'0','dir'});self.assertEqual(len(self.fake.deletes),6);self.assertFalse(self.fake.moves)
         self.assertEqual([r['name'] for r in self.fake.tree['dir'] if not r['folder']], ['main.mkv'])
         self.state.put_job({'id': 'test', 'status': 'completed', 'plan': plan})
-        self.assertEqual(self.state.restore('test')['restored'], 6)
+        self.assertEqual(self.state.restore('test')['restored'], 0)
         self.assertEqual(self.state.restore('test')['restored'], 0)
     def test_cleanup_defaults_off(self):
         self.fake.add('ad.mp4', 5)
         plan = self.plan(kind='jav')
-        self.assertEqual(plan['counts']['strm'], 1); self.assertEqual(plan['counts']['trash'], 0)
+        self.assertEqual(plan['counts']['strm'], 1); self.assertEqual(plan['counts']['delete'], 0)
     def test_changed_cloud_file_is_not_cleaned(self):
         self.fake.add('main.mkv'); ad = self.fake.add('ad.mp4', 10)
         plan = self.plan(kind='jav', cleanup=True); ad['size'] = 200_000_000
         result = self.run_plan(plan)
-        self.assertEqual(result['trashed'], 0); self.assertTrue(result['errors'])
+        self.assertEqual(result['deleted'], 0); self.assertTrue(result['errors'])
         self.assertFalse(self.fake.moves)
     def test_generation_failure_stops_remote_cleanup(self):
         self.fake.add('main.mkv'); self.fake.add('ad.exe', 10)
         plan = self.plan(kind='jav', cleanup=True)
         (self.target / 'main.strm').write_text('user content')
         result = self.run_plan(plan)
-        self.assertEqual(result['trashed'], 0); self.assertFalse(self.fake.moves)
+        self.assertEqual(result['deleted'], 0); self.assertFalse(self.fake.moves)
     def test_subtitles_match_episodes_and_language(self):
         self.fake.add('Series.S01E01.mkv'); self.fake.add('Series.S01E02.mkv')
         self.fake.add('Release.S01E02.chs.srt', 3)
@@ -151,7 +156,7 @@ class NativeCloudTests(unittest.TestCase):
         with self.assertRaises(CloudError): self.run_plan(plan)
     def test_cloud_monitor_adds_without_mount_and_never_cleans(self):
         self.fake.add('movie.mkv'); self.fake.add('ad.exe', 12)
-        w = self.state.watcher.save({'options': dict(self.options, kind='jav', cleanup=True, subtitle_mode='move', mode='path')})
+        w = self.state.watcher.save({'options': dict(self.options, kind='jav', cleanup=False, subtitle_mode='move', mode='path')})
         self.assertFalse(w['options']['cleanup']); self.assertEqual(w['options']['mode'], 'redirect')
         self.state.watcher.tick(); self.state.pool.submit(lambda: None).result(timeout=10)
         self.assertTrue((self.target/'movie.strm').exists()); self.assertFalse(self.fake.moves)
