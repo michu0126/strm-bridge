@@ -12,7 +12,7 @@ from .cloud import parse_uri, safe_name
 from .cloud_cookie import Cookie115
 from .cloud_providers import CloudError
 from .core import inside, walk
-from .upload115 import digest, UploadCancelled
+from .upload115 import digest, UploadCancelled, UploadTransientError
 
 TEMP_SUFFIXES = ('.part', '.partial', '.tmp', '.temp', '.crdownload', '.aria2', '.!qb', '.download', '.td', '.xltd')
 
@@ -450,6 +450,47 @@ class UploadWatcher:
         self.run(watch, self.active_job)
         return True
 
+    def transfer(self, client, path, parent, sha1, record, watch, checkpoint, progress, cancel, children):
+        def already_uploaded():
+            rows = [r for r in children(parent, True) if r['name'] == path.name]
+            if not rows:
+                return False
+            if (len(rows) == 1 and not rows[0]['folder'] and rows[0]['size'] == record['signature'][0]
+                    and rows[0].get('sha1', '').upper() == sha1):
+                return True
+            raise CloudError('自动重试时目标出现同名内容冲突，已保留本地文件')
+
+        for attempt, delay in enumerate((0, 3, 10)):
+            if delay:
+                watch.update(stage='等待自动重试（%s 秒）' % delay)
+                self.put(watch)
+                if self.stop.wait(delay):
+                    raise UploadCancelled('上传已暂停')
+            if cancel():
+                raise UploadCancelled('上传已暂停')
+            if file_signature(path) != record['signature']:
+                raise CloudError('源文件已变化，等待重新检查后上传')
+            if attempt and already_uploaded():
+                return
+            if attempt:
+                watch.update(stage='自动重试（第 %s / 3 次尝试）' % (attempt + 1))
+                self.put(watch)
+            try:
+                return client.upload(path, parent, sha1, session=record.get('session'),
+                    checkpoint=checkpoint, progress=progress, cancel=cancel)
+            except UploadTransientError as exc:
+                history = record.setdefault('retry_history', [])
+                history.append(dict(time=time.time(), phase=exc.phase, detail=exc.detail,
+                                    http_status=exc.http_status, attempt=attempt + 1))
+                record['retry_history'] = history[-10:]
+                record['transient_failures'] = record.get('transient_failures', 0) + 1
+                relative = path.relative_to(Path(watch['source'])).as_posix()
+                self.put_file(watch['id'], relative, record)
+                if attempt == 2:
+                    if already_uploaded():
+                        return
+                    raise CloudError(str(exc) + '；已尝试 3 次，请稍后重试此文件') from None
+
     def run(self, watch, job_id):
         state = self.state
         manual = watch.get('mode') == 'manual'
@@ -579,8 +620,8 @@ class UploadWatcher:
                             def checkpoint(session):
                                 current_record['session'] = session
                                 self.put_file(watch['id'], relative, current_record)
-                            client.upload(current_path, parent, sha1, session=current_record.get('session'),
-                                          checkpoint=checkpoint, progress=progress, cancel=cancel)
+                            self.transfer(client, current_path, parent, sha1, current_record, watch,
+                                          checkpoint, progress, cancel, children)
                             if file_signature(current_path) != current_record['signature']:
                                 raise CloudError('上传期间源文件发生变化，下一次检查后重试')
                             verified = False

@@ -9,6 +9,7 @@ from bridge.server import State
 from bridge.upload_watcher import UploadWatcher
 from bridge.cloud_providers import item
 from test_upload_watcher import Fake115
+from bridge.upload115 import UploadTransientError
 
 
 class ManualUploadTests(unittest.TestCase):
@@ -174,6 +175,22 @@ class ManualUploadTests(unittest.TestCase):
         self.state.uploads = UploadWatcher(self.state)
         self.state.uploads.tick()
         self.assertEqual(self.state.job(task['job_id'])['status'], 'completed')
+
+    def test_manual_task_recovers_transient_error_without_requiring_user_retry(self):
+        self.file('auto-retry.bin'); task = self.create([self.source/'auto-retry.bin'])
+        original = self.fake.upload; calls = []
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:raise UploadTransientError('初始化上传', 'HTTP 401', 401)
+            return original(*args, **kwargs)
+        self.fake.upload = flaky
+        with patch.object(self.state.uploads.stop, 'wait', return_value=False):self.state.uploads.tick()
+        job = self.state.job(task['job_id'])
+        self.assertEqual(job['status'], 'completed')
+        self.assertEqual(job['result']['uploaded'], 1)
+        self.assertEqual(job['result']['errors'], [])
+        self.assertFalse(self.state.uploads.get(task['id'])['enabled'])
+        self.assertEqual(len(calls), 2)
 
     def test_missing_pending_source_fails_without_marking_upload_success(self):
         p = self.file('missing.bin'); task = self.create([p]); p.unlink()

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from bridge.upload115 import upload, digest, UploadCancelled, multipart_init
+from bridge.upload115 import upload, digest, UploadCancelled, UploadTransientError, multipart_init
 from bridge.cloud_providers import CloudError
 
 
@@ -85,6 +85,42 @@ class UploadProtocolTests(unittest.TestCase):
         checkpoints = []
         with self.assertRaises(CloudError): upload(self.client, self.path, '0', self.sha, checkpoint=checkpoints.append)
         self.assertIsNone(checkpoints[-1])
+
+    def test_bad_initialization_response_is_retryable_and_identifies_the_phase(self):
+        for error in (json.JSONDecodeError('PRIVATE-KEY', '', 0), IndexError('private response')):
+            self.sdk.upload_file_init.side_effect = error
+            with self.assertRaises(UploadTransientError) as caught:
+                upload(self.client, self.path, '0', self.sha)
+            self.assertEqual(caught.exception.phase, '初始化上传')
+            self.assertNotIn('PRIVATE', str(caught.exception))
+            self.sdk.oss_multipart_upload_complete.assert_not_called()
+
+    def test_initialization_401_is_bounded_retryable_without_disclosing_request_url(self):
+        from urllib.error import HTTPError
+        self.sdk.upload_file_init.side_effect = HTTPError('https://example/?key=PRIVATE-KEY', 401, 'Unauthorized', {}, None)
+        with self.assertRaises(UploadTransientError) as caught:
+            upload(self.client, self.path, '0', self.sha)
+        self.assertEqual(caught.exception.http_status, 401)
+        self.assertNotIn('PRIVATE-KEY', str(caught.exception))
+
+    def test_part_list_timeout_preserves_the_saved_session(self):
+        self.sdk.oss_multipart_part_iter.side_effect = TimeoutError('private request')
+        checkpoints = []
+        with self.assertRaises(UploadTransientError) as caught:
+            upload(self.client, self.path, '0', self.sha, checkpoint=checkpoints.append)
+        self.assertEqual(caught.exception.phase, '读取续传分片')
+        self.assertEqual(checkpoints[-1]['upload_id'], 'upload-id')
+
+    def test_permission_denial_does_not_become_an_automatic_retry(self):
+        from types import SimpleNamespace
+        class Denied(Exception):
+            code = 403
+            fp = SimpleNamespace(data=b'<Error><Code>AccessDenied</Code></Error>')
+        self.sdk.upload_file_init.side_effect = Denied('PRIVATE-KEY')
+        with self.assertRaises(CloudError) as caught:
+            upload(self.client, self.path, '0', self.sha)
+        self.assertNotIsInstance(caught.exception, UploadTransientError)
+        self.assertNotIn('PRIVATE-KEY', str(caught.exception))
 
 
 if __name__ == '__main__': unittest.main()

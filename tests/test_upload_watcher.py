@@ -11,6 +11,7 @@ from bridge.server import State
 from bridge.cloud import uri
 from bridge.cloud_providers import item, CloudError
 from bridge.upload_watcher import UploadWatcher
+from bridge.upload115 import UploadTransientError
 
 
 class Fake115:
@@ -202,6 +203,94 @@ class UploadWatchTests(unittest.TestCase):
         self.run_watch()
         self.assertTrue(p.exists()); self.assertEqual(self.fake.calls, [])
         self.assertEqual(self.state.uploads.list()[0]['last_status'], 'partial')
+
+    def test_transient_failure_resumes_the_session_and_keeps_diagnostics_after_success(self):
+        path = self.write('retry.bin'); watch = self.save(include_existing=True)
+        original = self.fake.upload; sessions = []
+        def flaky(path, parent, sha1, **kwargs):
+            sessions.append(kwargs['session'])
+            if len(sessions) == 1:
+                kwargs['checkpoint']({'upload_id': 'preserved-session'})
+                raise UploadTransientError('上传分片', 'TimeoutError')
+            return original(path, parent, sha1, **kwargs)
+        self.fake.upload = flaky
+        with patch.object(self.state.uploads.stop, 'wait', return_value=False):self.run_watch()
+        record = self.state.uploads.files(watch['id'])['retry.bin']
+        self.assertEqual(sessions, [None, {'upload_id': 'preserved-session'}])
+        self.assertEqual(record['status'], 'uploaded')
+        self.assertEqual(record['retry_history'][0]['phase'], '上传分片')
+        self.assertEqual(record['transient_failures'], 1)
+        self.assertEqual(self.state.uploads.get(watch['id'])['last_result']['errors'], [])
+        self.assertTrue(path.exists())
+
+    def test_lost_success_response_checks_cloud_before_retrying_to_avoid_duplicate_upload(self):
+        self.write('ack-lost.bin'); self.save(include_existing=True)
+        original = self.fake.upload
+        def ack_lost(*args, **kwargs):
+            original(*args, **kwargs)
+            raise UploadTransientError('提交上传结果', 'JSONDecodeError')
+        self.fake.upload = ack_lost
+        with patch.object(self.state.uploads.stop, 'wait', return_value=False):self.run_watch()
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.fake.tree['0']), 1)
+        self.assertEqual(self.state.uploads.list()[0]['last_result']['uploaded'], 1)
+
+    def test_transient_retry_exhaustion_is_limited_to_three_attempts(self):
+        self.write('unavailable.bin'); watch = self.save(include_existing=True)
+        calls = []
+        def unavailable(*args, **kwargs):
+            calls.append(1)
+            raise UploadTransientError('初始化上传', 'HTTP 401', 401)
+        self.fake.upload = unavailable
+        with patch.object(self.state.uploads.stop, 'wait', return_value=False):self.run_watch()
+        record = self.state.uploads.files(watch['id'])['unavailable.bin']
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(record['status'], 'failed')
+        self.assertEqual(len(record['retry_history']), 3)
+        self.assertEqual(record['retry_history'][-1]['http_status'], 401)
+        self.assertEqual(len(self.state.uploads.get(watch['id'])['last_result']['errors']), 1)
+
+    def test_pause_during_backoff_stops_before_another_upload(self):
+        self.write('pause-retry.bin'); watch = self.save(include_existing=True)
+        calls = []
+        def unavailable(*args, **kwargs):
+            calls.append(1)
+            raise UploadTransientError('初始化上传', 'JSONDecodeError')
+        def pause(delay):
+            self.state.uploads.save({'id': watch['id'], 'enabled': False})
+            return False
+        self.fake.upload = unavailable
+        with patch.object(self.state.uploads.stop, 'wait', side_effect=pause):self.run_watch()
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.state.uploads.get(watch['id'])['enabled'])
+        self.assertEqual(self.state.uploads.files(watch['id'])['pause-retry.bin']['status'], 'pending')
+
+    def test_source_change_during_backoff_is_not_uploaded_or_deleted(self):
+        path = self.write('changing-retry.bin'); self.save(include_existing=True, delete_local=True)
+        calls = []
+        def unavailable(*args, **kwargs):
+            calls.append(1)
+            raise UploadTransientError('初始化上传', 'JSONDecodeError')
+        def change(delay):path.write_bytes(b'changed content');return False
+        self.fake.upload = unavailable
+        with patch.object(self.state.uploads.stop, 'wait', side_effect=change):self.run_watch()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(path.read_bytes(), b'changed content')
+
+    def test_same_name_conflict_appearing_during_backoff_is_preserved(self):
+        path = self.write('conflict-retry.bin'); self.save(include_existing=True)
+        calls = []
+        def unavailable(*args, **kwargs):
+            calls.append(1)
+            raise UploadTransientError('初始化上传', 'JSONDecodeError')
+        def conflict(delay):
+            self.fake.tree['0'] = [item('new-conflict', path.name, size=99, sha1='OTHER')]
+            return False
+        self.fake.upload = unavailable
+        with patch.object(self.state.uploads.stop, 'wait', side_effect=conflict):self.run_watch()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(path.exists())
+        self.assertEqual(self.fake.tree['0'][0]['id'], 'new-conflict')
 
 
 if __name__ == '__main__': unittest.main()
