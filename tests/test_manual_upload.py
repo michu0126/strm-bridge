@@ -54,9 +54,57 @@ class ManualUploadTests(unittest.TestCase):
         task = self.create([self.source / 'folder'])
         self.state.uploads.tick()
         folder = self.fake.tree['0'][0]
-        self.assertEqual(folder['name'], 'nested')
-        self.assertEqual({r['name'] for r in self.fake.tree[folder['id']]}, {'movie.mkv', 'poster.jpg'})
+        self.assertEqual(folder['name'], 'folder')
+        nested = self.fake.tree[folder['id']][0]
+        self.assertEqual(nested['name'], 'nested')
+        self.assertEqual({r['name'] for r in self.fake.tree[nested['id']]}, {'movie.mkv', 'poster.jpg'})
         self.assertEqual(self.state.uploads.get(task['id'])['last_result']['uploaded'], 2)
+
+    def test_selected_mount_root_keeps_its_name_without_accessing_parent(self):
+        self.file('季 1/原片名 #01.mkv')
+        task = self.create([self.source]); self.state.uploads.tick()
+        folder = self.fake.tree['0'][0]
+        self.assertEqual(folder['name'], self.source.name)
+        season = self.fake.tree[folder['id']][0]
+        self.assertEqual(season['name'], '季 1')
+        self.assertEqual(self.fake.tree[season['id']][0]['name'], '原片名 #01.mkv')
+        self.assertEqual(task['source'], str(self.source.resolve()))
+
+    def test_single_and_multiple_folder_selection_use_the_same_remote_paths(self):
+        self.file('影片甲/字幕/movie.srt'); self.file('影片乙/字幕/movie.srt')
+        task = self.create([self.source/'影片甲', self.source/'影片乙'])
+        self.state.uploads.tick()
+        self.assertEqual({r['name'] for r in self.fake.tree['0']}, {'影片甲', '影片乙'})
+        again = self.create([self.source/'影片甲']); self.state.uploads.tick()
+        self.assertEqual(self.state.uploads.get(again['id'])['last_result']['skipped'], 1)
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(self.state.uploads.get(task['id'])['last_result']['uploaded'], 2)
+
+    def test_empty_directory_tree_is_retained_and_original_directories_remain(self):
+        source = self.source/'空目录'/'子目录'; source.mkdir(parents=True)
+        task = self.create([source.parent]); self.state.uploads.tick()
+        folder = self.fake.tree['0'][0]
+        self.assertEqual(folder['name'], '空目录')
+        child = self.fake.tree[folder['id']][0]
+        self.assertEqual(child['name'], '子目录')
+        self.assertEqual(self.fake.tree[child['id']], [])
+        self.assertEqual(self.state.uploads.get(task['id'])['last_status'], 'completed')
+        self.assertTrue(source.is_dir())
+
+    def test_existing_folder_name_conflict_stops_instead_of_flattening(self):
+        self.file('folder/movie.mkv')
+        self.fake.tree['0'] = [item('existing-file', 'folder', size=5)]
+        task = self.create([self.source/'folder']); self.state.uploads.tick()
+        self.assertEqual(self.state.uploads.get(task['id'])['last_status'], 'failed')
+        self.assertEqual(self.fake.calls, [])
+        self.assertTrue((self.source/'folder/movie.mkv').exists())
+
+    def test_legacy_pending_task_retains_its_original_destination_on_resume(self):
+        self.file('folder/nested/movie.mkv')
+        task = self.create([self.source/'folder'])
+        task.pop('target_prefix'); self.state.uploads.put(task)
+        self.state.uploads.tick()
+        self.assertEqual(self.fake.tree['0'][0]['name'], 'nested')
 
     def test_large_task_keeps_one_job_and_a_frozen_manifest_across_batches(self):
         for i in range(205): self.file('folder/%03d.bin' % i)

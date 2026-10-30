@@ -86,6 +86,19 @@ class UploadWatchTests(unittest.TestCase):
         self.assertIsNone(self.state.busy)
         self.assertEqual(self.state.jobs()[0]['type'], 'upload')
 
+    def test_watch_retains_nested_folder_names_and_same_named_files_separately(self):
+        first = self.write('影片甲/Season 1/原片名 #01.mkv', b'first')
+        second = self.write('影片乙/Season 1/原片名 #01.mkv', b'second')
+        self.save(include_existing=True); self.run_watch()
+        self.assertEqual({row['name'] for row in self.fake.tree['0']}, {'影片甲', '影片乙'})
+        for folder in self.fake.tree['0']:
+            season = self.fake.tree[folder['id']][0]
+            self.assertEqual(season['name'], 'Season 1')
+            self.assertEqual(self.fake.tree[season['id']][0]['name'], '原片名 #01.mkv')
+        self.assertEqual(first.read_bytes(), b'first')
+        self.assertEqual(second.read_bytes(), b'second')
+        self.assertEqual(self.state.uploads.list()[0]['last_result']['uploaded'], 2)
+
     def test_optional_initial_upload_includes_all_types_but_not_temporary_downloads(self):
         for name in ['film.mkv', 'film.srt', 'poster.jpg', 'metadata.nfo', 'README']:
             self.write(name)

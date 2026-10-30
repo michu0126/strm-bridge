@@ -122,6 +122,12 @@ class UploadWatcher:
         if not target['folder']:
             raise ValueError('请选择 115 目标文件夹')
         paths = sorted(p.relative_to(source).as_posix() for p in selected)
+        # The scan root remains inside the allowed mount; retain a selected
+        # directory's own name separately instead of discarding its outer level.
+        prefix = safe_name(selected[0].name) if len(selected) == 1 and selected[0].is_dir() else ''
+        target_label = a['name'] + target['path']
+        if prefix:
+            target_label = target_label.rstrip('/') + '/' + prefix
         with self.state.lock:
             if any(w.get('mode') == 'manual' and w['enabled'] and w['source'] == str(source)
                    and w.get('selection') == paths and w['target'] == data['target'] for w in self.list()):
@@ -131,7 +137,7 @@ class UploadWatcher:
             task = dict(id=identifier, mode='manual', job_id=job_id,
                 name=str(data.get('name') or (selected[0].name if len(selected) == 1 else '手动上传 %s 项' % len(selected)))[:80],
                 source=str(source), selection=paths, manifest_ready=False, target=data['target'],
-                target_label=a['name'] + target['path'], account=account, parent=parent,
+                target_prefix=prefix, target_label=target_label, account=account, parent=parent,
                 interval=300, stable_seconds=0, include_existing=True,
                 delete_local=data.get('delete_local') is True, enabled=True, created=now,
                 next_run=now, last_status='queued', last_error='', uploaded_total=0)
@@ -314,6 +320,12 @@ class UploadWatcher:
     def manual_snapshot(self, task, cancel):
         root = self.task_source(task)
         result = {}
+        directories = set()
+        def visit(folder):
+            relative = Path(folder).relative_to(root)
+            for part in relative.parts:
+                safe_name(part)
+            directories.add(relative.as_posix())
         if task.get('manifest_ready'):
             paths = [root / name for name, row in self.files(task['id']).items() if row['status'] == 'pending']
         elif task.get('origin') == 'browser':
@@ -326,7 +338,7 @@ class UploadWatcher:
             selected = inside(selected, [root])
             if not selected.exists():
                 raise CloudError('手动上传的源文件已不存在：' + str(selected.relative_to(root)))
-            for p in walk(selected, cancel) if selected.is_dir() else (selected,):
+            for p in walk(selected, cancel, visit) if selected.is_dir() else (selected,):
                 if cancel():
                     raise UploadCancelled('上传已暂停')
                 if p.name.lower().endswith(TEMP_SUFFIXES):
@@ -336,6 +348,8 @@ class UploadWatcher:
                 for name in Path(relative).parts:
                     safe_name(name)
                 result[relative] = file_signature(p)
+        if not task.get('manifest_ready'):
+            task['directory_manifest'] = sorted(directories)
         return result
 
     def manual_totals(self, identifier):
@@ -499,13 +513,18 @@ class UploadWatcher:
                 result['waiting'] = 0
             else:
                 job['total'] = len(pending)
-            if pending:
+            directory_manifest = watch.get('directory_manifest', []) if manual else []
+            create_directories = directory_manifest and not watch.get('directories_ready')
+            if pending or create_directories:
                 recorded = True
                 state.put_job(job)
                 a = copy.deepcopy(state.clouds.account(watch['account']))
                 revision = a['revision']
                 client = Cookie115(a['credentials'])
                 directories, listings = {(): watch['parent']}, {}
+                prefix = PurePosixPath(watch.get('target_prefix') or '.').parts
+                for part in prefix:
+                    safe_name(part)
 
                 def children(parent, fresh=False):
                     if fresh or parent not in listings:
@@ -528,6 +547,14 @@ class UploadWatcher:
                     directories[key] = identifier
                     return identifier
 
+                if create_directories:
+                    for relative in directory_manifest:
+                        if cancel():
+                            raise UploadCancelled('上传已暂停')
+                        directory(prefix + PurePosixPath(relative).parts)
+                    watch['directories_ready'] = True
+                    self.put(watch)
+
                 for relative, current_record in pending[:200]:
                     if cancel():
                         raise UploadCancelled('上传已暂停')
@@ -538,7 +565,7 @@ class UploadWatcher:
                         sha1 = digest(current_path, cancel, progress)
                         if file_signature(current_path) != current_record['signature']:
                             raise CloudError('源文件仍在变化，稍后重试')
-                        parent = directory(Path(relative).parts[:-1])
+                        parent = directory(prefix + Path(relative).parts[:-1])
                         existing = [r for r in children(parent) if r['name'] == current_path.name]
                         if existing:
                             if (len(existing) == 1 and not existing[0]['folder'] and existing[0]['size'] == current_path.stat().st_size
