@@ -60,7 +60,7 @@
     if(!current||!selected.size)throw Error('请选择已检测为低于阈值的影片');
     const target=$('videoMoveTarget').dataset.cloud;
     if(operation==='move'&&!target)throw Error('请选择同一 115 账号的移动目标');
-    if(operation==='delete'&&!confirm(`将选中的 ${selected.size} 个网盘视频移入 115 回收站。已启用的目录同步会随后回收对应 STRM。确认删除？`))return;
+    if(operation==='delete'&&!await confirmAction(`将选中的 ${selected.size} 个网盘视频移入 115 回收站。已启用的目录同步会随后回收对应 STRM。确认删除？`))return;
     const data={scan_id:current.id,ids:[...selected],operation,target};
     if(operation==='move'){
       const preview=await api('/api/videos/move-preview',data);movePreview={...data,preview_id:preview.id};

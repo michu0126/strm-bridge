@@ -28,6 +28,7 @@ from .videos import VideoLibrary
 from .cloud import Clouds, is_cloud
 from .cloud_providers import CATALOG
 from .cloud_login import CloudLogin
+from .mounts import apply_mount_roots
 from . import emby, webdav
 
 STATIC = Path(__file__).parent.parent / 'static'
@@ -68,6 +69,7 @@ class State:
             self.config.setdefault('upload_roots', [])
         if not self.config_path.exists():
             self.save_config()
+        apply_mount_roots(self.config, self.data)
         for row in self.db.execute("SELECT id,value FROM jobs WHERE json_extract(value,'$.status') IN ('running','scanning','queued')").fetchall():
             j = json.loads(row[1])
             if j['status'] in ('running', 'scanning', 'queued'):

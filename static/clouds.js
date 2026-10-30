@@ -61,7 +61,7 @@
       const choose=textElement('button','选择目录','primary');choose.addEventListener('click',safe(async()=>{changePage('generate');$('source').dataset.cloud=a.source;$('source').value=a.name+'/';updateSourceMode();await openFolder('source',$('source'));}));
       const edit=textElement('button','编辑');edit.addEventListener('click',safe(()=>open(a)));
       const test=textElement('button','测试连接');test.addEventListener('click',safe(async()=>{test.disabled=true;test.textContent='连接中…';try{const r=await api('/api/clouds/test',{id:a.id});toast(r.message);}finally{await load();}}));
-      const remove=textElement('button','移除','text-button');remove.addEventListener('click',safe(async()=>{if(!confirm('移除“'+a.name+'”的连接？其监控会暂停，已有 STRM 将无法通过此账号播放；云端文件保留。'))return;await api('/api/clouds/delete',{id:a.id});await load();}));
+      const remove=textElement('button','移除','text-button');remove.addEventListener('click',safe(async()=>{if(!await confirmAction('移除“'+a.name+'”的连接？其监控会暂停，已有 STRM 将无法通过此账号播放；云端文件保留。'))return;await api('/api/clouds/delete',{id:a.id});await load();}));
       buttons.append(choose,edit,test,remove);card.append(buttons);$('cloudList').append(card);
     }
   }
