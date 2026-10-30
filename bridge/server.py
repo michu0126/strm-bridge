@@ -470,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(job)
             return self.respond({'error': '接口不存在'}, 404)
         name = 'index.html' if path == '/' else path.lstrip('/')
-        if name not in ('index.html', 'app.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'generated.js', 'cloud-tools.js', 'logo.svg'):
+        if name not in ('index.html', 'app.js', 'confirmation.js', 'style.css', 'appearance.js', 'appearance.css', 'clouds.js', 'uploads.js', 'generated.js', 'cloud-tools.js', 'logo.svg'):
             return self.respond({'error': '页面不存在'}, 404)
         return self.respond((STATIC / name).read_bytes(), content_type=mimetypes.guess_type(name)[0] + '; charset=utf-8')
 
