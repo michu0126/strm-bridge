@@ -361,6 +361,44 @@ class UploadWatcher:
             deleted=sum(bool(r.get('local_deleted')) for r in records.values()),
             errors=[{'path': p, 'message': r.get('error', '上传失败')} for p, r in records.items() if r['status'] == 'failed'])
 
+    def prune_empty_dirs(self, source, parents, include_source=False):
+        """Prune only ancestors of files deleted after a verified upload."""
+        root = Path(source)
+        try:
+            if inside(root, self.roots()) != root:
+                return []
+            config = self.state.config
+            protected_paths = self.roots() + config['source_roots'] + config['target_roots']
+            protected_paths += [w['source'] for w in self.list('watch')]
+            for w in self.state.watcher.list():
+                options = w.get('options', {})
+                protected_paths.extend((options.get('source'), options.get('target')))
+            protected = {Path(p).resolve() for p in protected_paths if p and Path(p).is_absolute()}
+        except (OSError, ValueError):
+            return []
+
+        candidates = set()
+        for folder in parents:
+            while folder.is_relative_to(root):
+                if folder == root and not include_source:
+                    break
+                candidates.add(folder)
+                if folder == root:
+                    break
+                folder = folder.parent
+
+        removed = []
+        for folder in sorted(candidates - protected, key=lambda p: (-len(p.parts), p.as_posix())):
+            try:
+                # Reject redirected paths; rmdir itself checks emptiness atomically.
+                if inside(folder, [root]) == folder:
+                    folder.rmdir()
+                    removed.append(folder)
+            except (OSError, ValueError):
+                # A folder may have gained new files or may be a read-only mount.
+                continue
+        return removed
+
     def save(self, data):
         if data.get('id'):
             with self.state.lock:
@@ -506,6 +544,7 @@ class UploadWatcher:
         if manual:
             state.put_job(job)
         revision = None
+        deleted_parents = set()
 
         def cancel():
             return self.stop.is_set() or job_id in self.cancelled
@@ -649,6 +688,7 @@ class UploadWatcher:
                                 raise CloudError('本地文件已变化，保留文件并等待重新检查')
                             current_path.unlink()
                             current_record['local_deleted'] = time.time()
+                            deleted_parents.add(current_path.parent)
                             result['deleted'] += 1
                         current_record.pop('error', None) if current_record['status'] != 'conflict' else None
                     except UploadCancelled:
@@ -665,6 +705,18 @@ class UploadWatcher:
                         watch['completed_count'] = job['done']
                         self.put(watch)
                     state.put_job(job)
+            if watch.get('delete_local') and watch.get('origin') != 'browser' and not cancel():
+                if manual:
+                    # The manifest spans multiple batches and resumes. Wait until
+                    # the whole selection succeeds before pruning its directories.
+                    if (result['deleted'] and job['done'] == job['total']
+                            and not result['errors'] and not result['conflicts']):
+                        root = Path(watch['source'])
+                        deleted_parents = {root / Path(path).parent for path, record in
+                                           self.files(watch['id']).items() if record.get('local_deleted')}
+                        self.prune_empty_dirs(root, deleted_parents, watch.get('selection') == ['.'])
+                elif deleted_parents:
+                    self.prune_empty_dirs(watch['source'], deleted_parents)
             status = 'partial' if result['errors'] or result['conflicts'] else ('completed' if recorded else 'idle')
             watch.update(last_status=status, last_result=result,
                          last_error='；'.join(e['message'] for e in result['errors'][:3]))

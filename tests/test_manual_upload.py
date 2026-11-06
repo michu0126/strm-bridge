@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from bridge.server import State
 from bridge.upload_watcher import UploadWatcher
-from bridge.cloud_providers import item
+from bridge.cloud_providers import CloudError, item
 from test_upload_watcher import Fake115
 from bridge.upload115 import UploadTransientError
 
@@ -148,6 +148,52 @@ class ManualUploadTests(unittest.TestCase):
         task = self.create([p], delete_local=True); self.state.uploads.tick()
         self.assertTrue(p.exists())
         self.assertEqual(self.state.uploads.get(task['id'])['last_status'], 'partial')
+
+    def test_delete_local_prunes_selected_folder_only_after_all_files_succeed(self):
+        uploaded = self.file('movie/disc-1/01.mkv')
+        retry = self.file('movie/disc-2/02.mkv')
+        unrelated = self.source / 'unselected-empty'
+        unrelated.mkdir()
+        task = self.create([self.source / 'movie'], delete_local=True)
+
+        def interrupt_second_file(path):
+            if path.name == retry.name:
+                raise CloudError('测试上传失败')
+
+        self.fake.on_upload = interrupt_second_file
+        self.state.uploads.tick()
+        self.assertEqual(self.state.job(task['job_id'])['status'], 'partial')
+        self.assertFalse(uploaded.exists())
+        self.assertTrue(uploaded.parent.is_dir())
+        self.assertTrue(retry.is_file())
+
+        self.fake.on_upload = None
+        self.state.uploads.manual_control(task['id'], 'retry')
+        self.state.uploads.tick()
+        self.assertEqual(self.state.job(task['job_id'])['status'], 'completed')
+        self.assertFalse((self.source / 'movie').exists())
+        self.assertTrue(unrelated.is_dir())
+        folder = self.fake.tree['0'][0]
+        self.assertEqual(folder['name'], 'movie')
+        self.assertEqual({self.fake.tree[d['id']][0]['name'] for d in self.fake.tree[folder['id']]},
+                         {'01.mkv', '02.mkv'})
+
+    def test_manual_delete_local_preserves_configured_monitor_and_mount_roots(self):
+        watched_file = self.file('watched/subfolder/movie.mkv')
+        watched = watched_file.parent.parent
+        self.state.uploads.save({'source': str(watched), 'target': self.account['source']})
+        self.create([watched], delete_local=True)
+        self.state.uploads.tick()
+        self.assertTrue(watched.is_dir())
+        self.assertFalse(watched_file.parent.exists())
+
+        mount_file = self.file('mount/movie.mkv')
+        self.state.config['upload_roots'] = [str(self.source), str(mount_file.parent)]
+        self.create([mount_file.parent], delete_local=True)
+        self.state.uploads.tick()
+        self.assertTrue(mount_file.parent.is_dir())
+        self.assertFalse(mount_file.exists())
+        self.assertTrue(watched.is_dir())
 
     def test_paused_queue_can_be_removed_without_uploading_or_deleting_source(self):
         p = self.file('keep.bin'); task = self.create([p])

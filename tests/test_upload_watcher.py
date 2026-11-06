@@ -179,6 +179,34 @@ class UploadWatchTests(unittest.TestCase):
         self.assertFalse(p.exists())
         self.assertEqual(self.state.uploads.get(watch['id'])['last_result']['deleted'], 1)
         self.assertEqual(len(self.fake.tree['0']), 1)
+
+    def test_delete_local_prunes_only_emptied_watch_subfolders(self):
+        video = self.write('uploaded/nested/movie.mkv')
+        pending = self.write('in-progress/movie.part')
+        finished = self.write('in-progress/completed.mkv')
+        untouched = self.source / 'untouched'
+        untouched.mkdir()
+        watch = self.save(include_existing=True, delete_local=True)
+        self.run_watch()
+        self.assertEqual(self.state.uploads.get(watch['id'])['last_result']['deleted'], 2)
+        self.assertFalse(video.parent.parent.exists())
+        self.assertFalse(finished.exists())
+        self.assertTrue(pending.is_file())
+        self.assertTrue(untouched.is_dir())
+        self.assertTrue(self.source.is_dir())
+        remote = next(r for r in self.fake.tree['0'] if r['name'] == 'uploaded')
+        nested = self.fake.tree[remote['id']][0]
+        self.assertEqual(self.fake.tree[nested['id']][0]['name'], video.name)
+
+    def test_directory_cleanup_error_does_not_change_verified_upload_result(self):
+        video = self.write('readonly-folder/movie.mkv')
+        watch = self.save(include_existing=True, delete_local=True)
+        with patch.object(Path, 'rmdir', side_effect=PermissionError('Cannot remove directory')):
+            self.run_watch()
+        self.assertFalse(video.exists())
+        self.assertTrue(video.parent.is_dir())
+        self.assertEqual(self.state.uploads.get(watch['id'])['last_status'], 'completed')
+
     def test_delete_local_keeps_failed_or_conflicting_files(self):
         failed = self.write('failed.mp4'); conflict = self.write('conflict.mp4')
         self.fake.fail = True
